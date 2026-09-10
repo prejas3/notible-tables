@@ -1558,7 +1558,6 @@ function mountGrid(context, container, objectId) {
   const shell = element("div", { className: "ntbl-shell" });
   root.append(shell);
   shell.addEventListener("mousedown", onGridMouseDown);
-  shell.addEventListener("mouseover", onGridMouseOver);
   shell.addEventListener("contextmenu", (event) => {
     const td = event.target instanceof Element ? event.target.closest("td[data-row-id]") : null;
     if (!td) return;
@@ -1712,13 +1711,27 @@ function mountGrid(context, container, objectId) {
     const extend = event.shiftKey;
     queueMicrotask(() => startSelection(rowId, colId, extend));
   }
-  function onGridMouseOver(event) {
+  // Extend on document `mousemove` + elementFromPoint, NOT `mouseover` on the
+  // grid: pressing on a cell starts a native text-selection drag inside that
+  // cell's <input>, and while that drag is live the browser stops dispatching
+  // mouseover/mouseenter on sibling elements — so a mouseover-based extend
+  // never sees the second cell and the range stays 1x1. The column/row/fill
+  // drags in this file already use this pattern for the same reason.
+  function onGridDragMove(event) {
     if (!dragging) return;
-    const td = event.target instanceof Element ? event.target.closest("td[data-row-id]") : null;
+    const target = document.elementFromPoint(event.clientX, event.clientY);
+    const td = target instanceof Element ? target.closest("td[data-row-id]") : null;
     if (!td) return;
     extendSelection(td.dataset.rowId, td.dataset.colId);
   }
+  // Suppress the native text-selection drag while a cell-range drag is in
+  // progress, so it neither fights the range highlight visually nor leaves a
+  // stray text selection in the last input. selectstart (not mousedown) —
+  // preventing it here does not block click-to-focus or click-to-edit.
+  function onGridSelectStart(event) { if (dragging) event.preventDefault(); }
   function onDocumentMouseUp() { dragging = false; }
+  document.addEventListener("mousemove", onGridDragMove);
+  document.addEventListener("selectstart", onGridSelectStart);
   document.addEventListener("mouseup", onDocumentMouseUp);
 
   function startColumnDrag(columnId) {
@@ -1860,20 +1873,12 @@ function mountGrid(context, container, objectId) {
 
     const range = getSelectionRange();
     if (!range || (range.rowIds.length === 1 && range.columnIds.length === 1)) return;
-    // "a cell is genuinely mid-edit" — only bail to the browser's native
-    // Ctrl+C/Delete/Backspace when the focused cell control actually holds a
-    // non-collapsed text selection (the user picked a fragment inside one
-    // cell). Plain focus is not enough: every cell IS an <input>, so focus
-    // sits in one right after a drag-select — the previous check made
-    // multi-cell copy silently fall through to copying a single cell.
-    // ponytail: selectionStart is null on <input type=number>/checkbox, so
-    // those never match here and the range op runs, which is what we want.
-    const active = document.activeElement;
-    const editingText = active instanceof HTMLElement && shell.contains(active)
-      && ["INPUT", "TEXTAREA"].includes(active.tagName)
-      && typeof active.selectionStart === "number"
-      && active.selectionStart !== active.selectionEnd;
-    if (editingText) return;
+    // Past the 1x1 early-return the range is explicitly multi-cell, so
+    // Ctrl+C / Delete act on the range unconditionally. No activeElement
+    // guard: focus always sits in a cell <input> after selecting (every
+    // cell is one), and shift-click leaves a text selection there — the old
+    // guard read that as "mid-edit" and fell through to a single-cell copy.
+    // Single-cell / mid-typing is the 1x1 case, already returned above.
     const meta = event.ctrlKey || event.metaKey;
     if (meta && event.key.toLowerCase() === "c") {
       event.preventDefault();
@@ -2152,6 +2157,8 @@ function mountGrid(context, container, objectId) {
       document.removeEventListener("mousedown", onDocumentPointerDown);
       document.removeEventListener("keydown", onDocumentKeyDown);
       document.removeEventListener("mouseup", onDocumentMouseUp);
+      document.removeEventListener("mousemove", onGridDragMove);
+      document.removeEventListener("selectstart", onGridSelectStart);
       document.removeEventListener("mousemove", onColumnDragMove);
       document.removeEventListener("mouseup", onColumnDragEnd);
       document.removeEventListener("mousemove", onRowDragMove);
@@ -2328,7 +2335,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.1",
+    version: "0.6.2",
     apiVersion: "1.8",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range to copy/paste/delete or bulk bold/color it, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
