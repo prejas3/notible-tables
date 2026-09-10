@@ -849,9 +849,15 @@ export function toCsv(table, resolveTitle) {
  * compare numerically (`false` < `true`); text and date compare as strings —
  * a date column is stored `YYYY-MM-DD`, which already sorts correctly as
  * text, so it does not need its own branch. */
-function compareCells(a, b, type) {
+function compareCells(a, b, type, resolveTitle) {
   if (type === "number") return (typeof a === "number" ? a : 0) - (typeof b === "number" ? b : 0);
   if (type === "checkbox") return Number(a === true) - Number(b === true);
+  // A `link` cell stores an object id; sort by the referenced object's
+  // current title when a resolver is available, else fall back to the id.
+  if (type === "link" && resolveTitle) {
+    a = a ? (resolveTitle(a) ?? a) : "";
+    b = b ? (resolveTitle(b) ?? b) : "";
+  }
   return String(a ?? "").localeCompare(String(b ?? ""), undefined, { sensitivity: "base", numeric: true });
 }
 
@@ -860,14 +866,14 @@ function compareCells(a, b, type) {
  * `sort: null` — a table with no sort applied keeps the order rows were
  * added in, same as it would on disk.
  */
-export function sortRows(rows, columns, sort) {
+export function sortRows(rows, columns, sort, resolveTitle) {
   if (!sort) return rows;
   const column = columns.find((candidate) => candidate.id === sort.columnId);
   if (!column) return rows;
   const direction = sort.direction === "desc" ? -1 : 1;
   // A stable copy: Array.prototype.sort mutates, and every caller here holds
   // the array as a prop value that must not change out from under React.
-  return [...rows].sort((left, right) => direction * compareCells(left.cells[column.id], right.cells[column.id], column.type));
+  return [...rows].sort((left, right) => direction * compareCells(left.cells[column.id], right.cells[column.id], column.type, resolveTitle));
 }
 
 /** Does `row` pass every active filter? A checkbox filter is
@@ -898,8 +904,8 @@ export function filterRows(rows, columns, filters) {
 /** Filter, then sort — the order the grid always applies them in: sorting a
  * filtered-out row would be wasted work, and a user watching a column's sort
  * arrow expects it to describe what is currently on screen. */
-export function visibleRows(table, filters, sort) {
-  return sortRows(filterRows(table.rows, table.columns, filters), table.columns, sort);
+export function visibleRows(table, filters, sort, resolveTitle) {
+  return sortRows(filterRows(table.rows, table.columns, filters), table.columns, sort, resolveTitle);
 }
 
 /** Which row ids / column ids fall inside a selection, resolved against one
@@ -1337,7 +1343,7 @@ function formattingToolbar(store, range) {
  * cell is the top-left of an existing merge — plus row/column insert and
  * duplicate actions for `rowId`/`colId`, the actual cell that was
  * right-clicked, which always apply regardless of how big the selection is. */
-function rangeMenu_(store, range, sort, filters, rowId, colId, closeMenu) {
+function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, closeMenu) {
   const menu = element("div", { className: "ntbl-rangemenu" });
   const isMultiCell = range.rowIds.length > 1 || range.columnIds.length > 1;
   const rowIndexes = range.rowIds.map((id) => store.table.rows.findIndex((row) => row.id === id));
@@ -1357,6 +1363,21 @@ function rangeMenu_(store, range, sort, filters, rowId, colId, closeMenu) {
     mergeButton.title = viewConstrained ? "Clear the active sort or filter first — merge needs rows and columns in their stored order." : "";
     mergeButton.addEventListener("click", () => { closeMenu(); void store.apply(mergeCells(store.table, range, sort, filters)); });
     menu.append(mergeButton);
+  }
+
+  menu.append(element("div", { className: "ntbl-rangemenu-sep" }));
+  for (const [label, run, danger] of [
+    ["Copy", () => navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).catch(() => store.context?.ui?.notice?.("Could not copy: the clipboard is unavailable.")), false],
+    ["Paste", async () => {
+      let tsv = "";
+      try { tsv = await navigator.clipboard.readText(); } catch { return; }
+      if (tsv) await store.apply(applyTsvPaste(store.table, range, tsv, sort, filters));
+    }, false],
+    ["Clear contents", () => store.apply(clearRangeCells(store.table, range)), true],
+  ]) {
+    const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
+    button.addEventListener("click", () => { closeMenu(); void run(); });
+    menu.append(button);
   }
 
   menu.append(element("div", { className: "ntbl-rangemenu-sep" }));
@@ -1580,7 +1601,7 @@ function mountGrid(context, container, objectId) {
   // creation/lookup (mergeCells, rangeMenu_) deliberately still resolves
   // storage-order indices on its own; only this function's callers see the
   // view-order result.
-  function getSelectionRange() { return resolveSelection(visibleRows(store.table, filters, sort), store.table.columns, selection); }
+  function getSelectionRange() { return resolveSelection(visibleRows(store.table, filters, sort, resolveTitle), store.table.columns, selection); }
 
   // Selection is a pure highlight state — it never touches `table`, so it
   // must never rebuild the grid's DOM. A full render() here would tear down
@@ -1614,7 +1635,7 @@ function mountGrid(context, container, objectId) {
     }
     // Header / row-handle highlight when the selection covers a full column
     // or a full row.
-    const fullCol = Boolean(range && range.rowIds.length === visibleRows(store.table, filters, sort).length);
+    const fullCol = Boolean(range && range.rowIds.length === visibleRows(store.table, filters, sort, resolveTitle).length);
     const fullRow = Boolean(range && range.columnIds.length === store.table.columns.length);
     for (const th of shell.querySelectorAll("th[data-col-id]")) {
       th.classList.toggle("is-col-selected", fullCol && range.columnIds.includes(th.dataset.colId));
@@ -1672,7 +1693,7 @@ function mountGrid(context, container, objectId) {
   // keeps the existing anchor on the pinned axis so a second click grows a
   // contiguous block of columns / rows.
   function selectColumn(colId, extend) {
-    const visIds = visibleRows(store.table, filters, sort).map((row) => row.id);
+    const visIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
     if (!visIds.length) return;
     const first = visIds[0];
     const last = visIds[visIds.length - 1];
@@ -1789,7 +1810,7 @@ function mountGrid(context, container, objectId) {
   // row strictly below the selection's last row, up to wherever the pointer
   // is when it releases.
   function computeFillTargetRows(source, overRowId) {
-    const visIds = visibleRows(store.table, filters, sort).map((row) => row.id);
+    const visIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
     const sourceEndIndex = visIds.indexOf(source.rowIds[source.rowIds.length - 1]);
     const overIndex = visIds.indexOf(overRowId);
     if (sourceEndIndex === -1 || overIndex === -1 || overIndex <= sourceEndIndex) return null;
@@ -1841,25 +1862,42 @@ function mountGrid(context, container, objectId) {
   function onDocumentKeyDown(event) {
     if (event.key === "Escape") { hideColumnMenu(); hideRangeMenu(); return; }
 
-    // Tab/Enter move the active cell — Excel's own bindings for "confirm
-    // and move on" — and work for a single selected cell (unlike Ctrl+C/
-    // Delete below), since a single cell IS the common case while filling
-    // in a table one field at a time. Only intercepted while focus is
-    // actually inside one of this grid's own controls, so Tab/Enter
-    // anywhere else in the app keeps its normal meaning.
-    if (event.key === "Tab" || event.key === "Enter") {
-      const focused = document.activeElement;
-      const isGridControl = focused instanceof Element && shell.contains(focused) && ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName);
-      if (!isGridControl) return;
+    const focused = document.activeElement;
+    const isGridControl = focused instanceof Element && shell.contains(focused) && ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName);
+
+    // Move the active cell. Tab/Enter always (Excel's "confirm and move
+    // on"); arrow keys only when the caret cannot travel further inside the
+    // current input in that direction — so typing and caret movement inside
+    // a cell keep working, and stepping off the edge moves to the next cell.
+    function caretAtEdge(dir) {
+      if (focused instanceof HTMLSelectElement) return false; // arrows change the option
+      if (focused instanceof HTMLInputElement && focused.type === "checkbox") return true;
+      if (!(focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement)) return true;
+      let start, end;
+      try { start = focused.selectionStart; end = focused.selectionEnd; } catch { return true; }
+      if (start === null || end === null) return true; // number input: no caret info
+      if (start !== end) return false; // a fragment is selected
+      return (dir === "up" || dir === "left") ? start === 0 : end === focused.value.length;
+    }
+    let move = null;
+    if (isGridControl && (event.key === "Tab" || event.key === "Enter")) {
+      move = event.key === "Enter" ? [event.shiftKey ? -1 : 1, 0] : [0, event.shiftKey ? -1 : 1];
+    } else if (isGridControl && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      if (event.key === "ArrowUp" && caretAtEdge("up")) move = [-1, 0];
+      else if (event.key === "ArrowDown" && caretAtEdge("down")) move = [1, 0];
+      else if (event.key === "ArrowLeft" && caretAtEdge("left")) move = [0, -1];
+      else if (event.key === "ArrowRight" && caretAtEdge("right")) move = [0, 1];
+    }
+    if (move) {
       const range = getSelectionRange();
       if (!range) return;
-      const visibleIds = visibleRows(store.table, filters, sort).map((row) => row.id);
+      const visibleIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
       const columnIds = store.table.columns.map((column) => column.id);
       let rowIndex = visibleIds.indexOf(range.rowIds[range.rowIds.length - 1]);
       let colIndex = columnIds.indexOf(range.columnIds[range.columnIds.length - 1]);
       if (rowIndex === -1 || colIndex === -1) return;
-      if (event.key === "Enter") rowIndex += event.shiftKey ? -1 : 1;
-      else colIndex += event.shiftKey ? -1 : 1;
+      rowIndex += move[0];
+      colIndex += move[1];
       if (rowIndex < 0 || rowIndex >= visibleIds.length || colIndex < 0 || colIndex >= columnIds.length) return;
       event.preventDefault();
       const nextRowId = visibleIds[rowIndex];
@@ -1871,6 +1909,58 @@ function mountGrid(context, container, objectId) {
       return;
     }
 
+    const meta = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+
+    // Ctrl/Cmd+A: select the whole grid — but only once the focused cell's
+    // own text is already all-selected or empty, so the first press still
+    // selects text inside the cell the way it does anywhere else.
+    if (meta && key === "a" && isGridControl) {
+      const f = focused;
+      let textAllSelected = true; // checkbox/number inputs have no caret — go straight to grid select
+      try {
+        if (f && "value" in f && typeof f.selectionStart === "number") {
+          textAllSelected = f.value === "" || (f.selectionStart === 0 && f.selectionEnd === f.value.length);
+        }
+      } catch { /* no caret info: treat as ready for grid select */ }
+      if (!textAllSelected) return;
+      const visibleIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
+      const columnIds = store.table.columns.map((column) => column.id);
+      if (!visibleIds.length || !columnIds.length) return;
+      event.preventDefault();
+      startSelection(visibleIds[0], columnIds[0], false);
+      extendSelection(visibleIds[visibleIds.length - 1], columnIds[columnIds.length - 1]);
+      return;
+    }
+
+    // Ctrl/Cmd+D / +R: fill down / right. A multi-row (resp. multi-column)
+    // selection fills from its own first row (column); a single row/column
+    // fills from the neighbour just before it. Same literal copy as the
+    // fill handle — no reference rewriting.
+    if (meta && (key === "d" || key === "r")) {
+      const range = getSelectionRange();
+      if (!range) return;
+      event.preventDefault();
+      const visibleIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
+      const columnIds = store.table.columns.map((column) => column.id);
+      if (key === "d") {
+        if (range.rowIds.length > 1) {
+          void store.apply(fillRange(store.table, { rowIds: [range.rowIds[0]], columnIds: range.columnIds }, { rowIds: range.rowIds.slice(1), columnIds: range.columnIds }));
+        } else {
+          const i = visibleIds.indexOf(range.rowIds[0]);
+          if (i > 0) void store.apply(fillRange(store.table, { rowIds: [visibleIds[i - 1]], columnIds: range.columnIds }, { rowIds: [range.rowIds[0]], columnIds: range.columnIds }));
+        }
+      } else {
+        if (range.columnIds.length > 1) {
+          void store.apply(fillRange(store.table, { rowIds: range.rowIds, columnIds: [range.columnIds[0]] }, { rowIds: range.rowIds, columnIds: range.columnIds.slice(1) }));
+        } else {
+          const i = columnIds.indexOf(range.columnIds[0]);
+          if (i > 0) void store.apply(fillRange(store.table, { rowIds: range.rowIds, columnIds: [columnIds[i - 1]] }, { rowIds: range.rowIds, columnIds: [range.columnIds[0]] }));
+        }
+      }
+      return;
+    }
+
     const range = getSelectionRange();
     if (!range || (range.rowIds.length === 1 && range.columnIds.length === 1)) return;
     // Past the 1x1 early-return the range is explicitly multi-cell, so
@@ -1879,8 +1969,7 @@ function mountGrid(context, container, objectId) {
     // cell is one), and shift-click leaves a text selection there — the old
     // guard read that as "mid-edit" and fell through to a single-cell copy.
     // Single-cell / mid-typing is the 1x1 case, already returned above.
-    const meta = event.ctrlKey || event.metaKey;
-    if (meta && event.key.toLowerCase() === "c") {
+    if (meta && key === "c") {
       event.preventDefault();
       void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).catch(() => {
         context.ui.notice("Could not copy: the clipboard is unavailable.");
@@ -1954,7 +2043,7 @@ function mountGrid(context, container, objectId) {
       tableEl.append(thead);
 
       const tbody = element("tbody");
-      const rows = visibleRows(table, filters, sort);
+      const rows = visibleRows(table, filters, sort, resolveTitle);
       const range = getSelectionRange();
       const merges = table.merges ?? [];
       const coveredCells = new Set();
@@ -2139,7 +2228,7 @@ function mountGrid(context, container, objectId) {
           ? selRange
           : { rowIds: [rangeMenu.rowId], columnIds: [rangeMenu.colId] };
         const overlay = element("div", { className: "ntbl-rangemenu-overlay" });
-        const panel = rangeMenu_(store, range, sort, filters, rangeMenu.rowId, rangeMenu.colId, hideRangeMenu);
+        const panel = rangeMenu_(store, range, sort, filters, resolveTitle, rangeMenu.rowId, rangeMenu.colId, hideRangeMenu);
         panel.style.left = `${Math.max(8, Math.min(rangeMenu.x, window.innerWidth - 200))}px`;
         panel.style.top = `${Math.max(8, Math.min(rangeMenu.y, window.innerHeight - 100))}px`;
         overlay.append(panel);
@@ -2335,9 +2424,9 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.2",
+    version: "0.6.3",
     apiVersion: "1.8",
-    description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range to copy/paste/delete or bulk bold/color it, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
+    description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
     permissions: ["data.read", "data.write", "workspace.ui"],
   },

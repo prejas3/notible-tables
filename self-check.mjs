@@ -142,6 +142,19 @@ const descending = sortRows(sortable.rows, sortable.columns, { columnId: scoreId
 assert.deepEqual(descending.map((row) => row.cells[scoreId]), [3, 2, 1]);
 assert.equal(sortRows(sortable.rows, sortable.columns, null), sortable.rows, "no sort returns the exact same array reference");
 
+// --- a `link` column sorts by the referenced object's title when a resolver is given, by id otherwise
+let linkSort = parseTable({ props: "{}" });
+linkSort = addColumn(linkSort, { name: "Ref", type: "link" });
+linkSort = addRow(linkSort); linkSort = addRow(linkSort);
+const refId = linkSort.columns[0].id;
+linkSort = setCell(linkSort, linkSort.rows[0].id, refId, "obj-zzz");
+linkSort = setCell(linkSort, linkSort.rows[1].id, refId, "obj-aaa");
+const titles = { "obj-zzz": "Apple", "obj-aaa": "Zebra" };
+const byTitle = sortRows(linkSort.rows, linkSort.columns, { columnId: refId, direction: "asc" }, (id) => titles[id]);
+assert.deepEqual(byTitle.map((r) => r.cells[refId]), ["obj-zzz", "obj-aaa"], "link sort follows resolved titles (Apple < Zebra)");
+const byId = sortRows(linkSort.rows, linkSort.columns, { columnId: refId, direction: "asc" });
+assert.deepEqual(byId.map((r) => r.cells[refId]), ["obj-aaa", "obj-zzz"], "with no resolver, link sort falls back to id order");
+
 // --- filtering: text substring, checkbox tri-state, blank filter passes everything
 let filterable = parseTable({ props: "{}" });
 filterable = addColumn(filterable, { name: "Name", type: "text" });
