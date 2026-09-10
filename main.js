@@ -1860,12 +1860,20 @@ function mountGrid(context, container, objectId) {
 
     const range = getSelectionRange();
     if (!range || (range.rowIds.length === 1 && range.columnIds.length === 1)) return;
-    // "no cell is mid-edit" — if focus is sitting in one of this grid's own
-    // editable controls, let the browser handle Ctrl+C/Delete/Backspace
-    // natively (e.g. copying selected text, deleting a typed character)
-    // rather than hijacking it for the whole range.
+    // "a cell is genuinely mid-edit" — only bail to the browser's native
+    // Ctrl+C/Delete/Backspace when the focused cell control actually holds a
+    // non-collapsed text selection (the user picked a fragment inside one
+    // cell). Plain focus is not enough: every cell IS an <input>, so focus
+    // sits in one right after a drag-select — the previous check made
+    // multi-cell copy silently fall through to copying a single cell.
+    // ponytail: selectionStart is null on <input type=number>/checkbox, so
+    // those never match here and the range op runs, which is what we want.
     const active = document.activeElement;
-    if (active instanceof Element && shell.contains(active) && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) return;
+    const editingText = active instanceof HTMLElement && shell.contains(active)
+      && ["INPUT", "TEXTAREA"].includes(active.tagName)
+      && typeof active.selectionStart === "number"
+      && active.selectionStart !== active.selectionEnd;
+    if (editingText) return;
     const meta = event.ctrlKey || event.metaKey;
     if (meta && event.key.toLowerCase() === "c") {
       event.preventDefault();
@@ -2320,7 +2328,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.0",
+    version: "0.6.1",
     apiVersion: "1.8",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range to copy/paste/delete or bulk bold/color it, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",

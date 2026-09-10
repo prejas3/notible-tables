@@ -1,7 +1,7 @@
 {
   "id": "notible.tables",
   "name": "Notible Tables",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "apiVersion": "1.8",
   "minCoreVersion": "0.80.0",
   "description": "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range to copy/paste/delete or bulk bold/color it, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
