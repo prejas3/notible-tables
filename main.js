@@ -46,25 +46,28 @@ export function parseNumberFormat(raw) {
 }
 
 /** Render one numeric value through a `column.format`. A non-number (an empty
- * cell) passes straight through as "". */
-export function formatNumber(value, format) {
+ * cell) passes straight through as "". `locale` defaults to the runtime's own
+ * (OS/browser) locale, same as a bare `toLocaleString()` — pass the app's own
+ * `context.i18n.locale` at display call sites so a column's grouping/decimal
+ * separators follow the app's language setting rather than the OS's. */
+export function formatNumber(value, format, locale) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "";
   const decimals = format?.decimals ?? 0;
   if (format?.style === "percent") return `${(value * 100).toFixed(decimals)}%`;
-  const body = value.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const body = value.toLocaleString(locale, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
   if (format?.style === "currency" && format.symbol) return `${format.symbol} ${body}`;
   return body;
 }
 
-/** Parse text that may be using the runtime's own locale grouping/decimal
- * separators (what `formatNumber` above just produced) back into a plain
- * number. NaN means "could not parse" — callers must not coerce that to 0,
- * or a stray keystroke silently zeroes a cell. */
-export function parseFormattedNumber(raw) {
+/** Parse text that may be using `locale`'s grouping/decimal separators (what
+ * `formatNumber` above just produced with the same `locale`) back into a
+ * plain number. NaN means "could not parse" — callers must not coerce that
+ * to 0, or a stray keystroke silently zeroes a cell. */
+export function parseFormattedNumber(raw, locale) {
   if (typeof raw !== "string") return NaN;
   const trimmed = raw.trim();
   if (trimmed === "") return NaN;
-  const parts = new Intl.NumberFormat().formatToParts(1234.5);
+  const parts = new Intl.NumberFormat(locale).formatToParts(1234.5);
   const group = parts.find((p) => p.type === "group")?.value ?? ",";
   const decimal = parts.find((p) => p.type === "decimal")?.value ?? ".";
   let normalized = trimmed.split(group).join("");
@@ -553,6 +556,17 @@ function adjustMergesForRemoval(merges, axis, removedIndex) {
   return next;
 }
 
+/** Whether any row has a non-blank value in this column — used to decide if
+ * deleting it needs a confirm-arm click, since there is no undo. */
+export function columnHasData(table, columnId) {
+  return table.rows.some((row) => { const v = row.cells[columnId]; return v !== undefined && v !== null && v !== ""; });
+}
+
+/** Same idea as `columnHasData`, for one row. */
+export function rowHasData(row) {
+  return Object.values(row.cells ?? {}).some((v) => v !== undefined && v !== null && v !== "");
+}
+
 /** Drop a column and every row's value for it. */
 export function removeColumn(table, columnId) {
   const columnIndex = table.columns.findIndex((column) => column.id === columnId);
@@ -989,6 +1003,39 @@ function element(tag, properties = {}, children = []) {
   return node;
 }
 
+/** There is no undo for a column/row delete (see removeColumn/removeRow),
+ * so a destructive button that would drop actual data requires a second
+ * click within a short window instead of firing on the first. The button's
+ * own label/title carry the armed state — no modal, no new plugin-api
+ * surface. Armed state resets after 2.5s or on blur, whichever first. */
+function armOnFirstClick(button, { armedLabel, armedTitle, run }) {
+  let armed = false;
+  let timer = null;
+  const idleLabel = button.textContent;
+  const idleTitle = button.title;
+  const disarm = () => {
+    armed = false;
+    if (timer) { clearTimeout(timer); timer = null; }
+    button.classList.remove("ntbl-danger-armed");
+    button.textContent = idleLabel;
+    button.title = idleTitle;
+  };
+  button.addEventListener("click", (event) => {
+    if (!armed) {
+      armed = true;
+      button.classList.add("ntbl-danger-armed");
+      if (armedLabel) button.textContent = armedLabel;
+      button.title = armedTitle ?? "Click again to confirm";
+      timer = setTimeout(disarm, 2500);
+      event.stopPropagation();
+      return;
+    }
+    disarm();
+    run();
+  });
+  button.addEventListener("blur", disarm);
+}
+
 /** Every string drawn below reaches the DOM through `textContent` or a
  * form control's `.value`, never through markup built from a string — same
  * rule notible-habits keeps, for the same reason: a table's cells and column
@@ -1000,6 +1047,13 @@ function text(tag, value, className) {
   return node;
 }
 
+// How many past states Ctrl+Z can step back through. Each entry is a whole
+// `table` object, but edits are already immutable/structural-sharing (every
+// pure function above returns new top-level arrays, reusing untouched row/
+// column objects), so this is a handful of shallow references, not deep
+// clones — cheap to keep bounded history for.
+const UNDO_LIMIT = 50;
+
 class TableStore {
   constructor(context, objectId) {
     this.context = context;
@@ -1009,6 +1063,7 @@ class TableStore {
     this.loading = true;
     this.error = null;
     this.updatedAt = undefined;
+    this.history = [];
   }
 
   onChange(listener) {
@@ -1053,6 +1108,27 @@ class TableStore {
    * fresh timestamp, rather than surfacing a raw "conflict" on every
    * keystroke of a fast typist. */
   async apply(next) {
+    this.history.push(this.table);
+    if (this.history.length > UNDO_LIMIT) this.history.shift();
+    await this.persist(next);
+  }
+
+  get canUndo() {
+    return this.history.length > 0;
+  }
+
+  /** Step one edit back — column/row deletes included, since those are
+   * exactly the edits that used to have no recovery path at all (Ctrl+Z fell
+   * through to whatever the browser considered "undoable", which was never
+   * this table). Does not push the state it's leaving onto `history` — undo
+   * is one-directional, not undo/redo. */
+  async undo() {
+    const previous = this.history.pop();
+    if (previous === undefined) return;
+    await this.persist(previous);
+  }
+
+  async persist(next) {
     this.table = next;
     this.announce();
     const patch = { props: serializeTable(next) };
@@ -1098,7 +1174,7 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
   const source = rawRow ? rawRow.cells[column.id] : value;
   if (isFormula(source)) {
     const display = column.type === "number" && column.format && typeof value === "number"
-      ? formatNumber(value, column.format)
+      ? formatNumber(value, column.format, store.context?.i18n?.locale)
       : (value == null ? "" : String(value));
     const input = element("input", { type: "text", className: "ntbl-cell-input ntbl-cell-formula", value: display });
     input.dataset.focusKey = focusKey;
@@ -1135,17 +1211,28 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
       placeholder: "[[Object title]]",
     });
     input.dataset.focusKey = focusKey;
+    // On no/ambiguous match, DO NOT commit — committing the old stored value
+    // would rebuild this cell from `value` and wipe whatever the user just
+    // typed, with only a toast (easy to miss) as a trace it ever happened.
+    // Leaving the input's own DOM value untouched keeps the typed text on
+    // screen so the user can fix the title or clear the cell themselves; the
+    // `--unresolved` class flags that it is not actually saved yet.
     input.addEventListener("change", async () => {
       const query = input.value.replace(/^\s*\[\[|\]\]\s*$/g, "").trim();
       if (!query) { commit(""); return; }
+      input.classList.remove("ntbl-cell-link--unresolved");
       try {
         const objects = await store.context.data.objects.query({ limit: 5000 });
         const exact = objects.find((object) => (object.title || "").toLowerCase() === query.toLowerCase());
         const prefix = objects.filter((object) => (object.title || "").toLowerCase().startsWith(query.toLowerCase()));
         const hit = exact ?? (prefix.length === 1 ? prefix[0] : null);
-        if (hit) commit(hit.id);
-        else { store.context.ui.notice(`No single object titled "${query}".`); commit(value); }
-      } catch (cause) { store.context.ui.notice(`Could not look up "${query}": ${String(cause?.message ?? cause)}`); commit(value); }
+        if (hit) { commit(hit.id); return; }
+        store.context.ui.notice(`No single object titled "${query}" — left as typed, not saved. Fix the title or clear the cell.`);
+        input.classList.add("ntbl-cell-link--unresolved");
+      } catch (cause) {
+        store.context.ui.notice(`Could not look up "${query}": ${String(cause?.message ?? cause)}`);
+        input.classList.add("ntbl-cell-link--unresolved");
+      }
     });
     wrap.append(input);
     if (typeof value === "string" && value) {
@@ -1161,19 +1248,20 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
   // commit (strip the symbol / grouping / percent sign). A plain number
   // column keeps the native <input type="number">.
   if (column.type === "number" && column.format) {
+    const locale = store.context?.i18n?.locale;
     const input = element("input", {
       type: "text",
       inputMode: "decimal",
       className: "ntbl-cell-input",
-      value: typeof value === "number" ? formatNumber(value, column.format) : "",
+      value: typeof value === "number" ? formatNumber(value, column.format, locale) : "",
     });
     input.dataset.focusKey = focusKey;
     input.addEventListener("focus", () => { input.value = typeof value === "number" ? String(value) : ""; });
-    input.addEventListener("blur", () => { input.value = typeof value === "number" ? formatNumber(value, column.format) : input.value; });
+    input.addEventListener("blur", () => { input.value = typeof value === "number" ? formatNumber(value, column.format, locale) : input.value; });
     input.addEventListener("change", () => {
       if (input.value.trim() === "") { commit(""); return; }
-      const parsed = parseFormattedNumber(input.value);
-      if (!Number.isFinite(parsed)) { input.value = typeof value === "number" ? formatNumber(value, column.format) : ""; return; }
+      const parsed = parseFormattedNumber(input.value, locale);
+      if (!Number.isFinite(parsed)) { input.value = typeof value === "number" ? formatNumber(value, column.format, locale) : ""; return; }
       commit(parsed);
     });
     return input;
@@ -1408,7 +1496,11 @@ function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, clo
   ]) {
     const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
     if (danger && store.table.rows.length <= 1) button.disabled = true;
-    button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
+    if (label === "Delete row" && !button.disabled && rowHasData(store.table.rows.find((row) => row.id === rowId) ?? { cells: {} })) {
+      armOnFirstClick(button, { armedTitle: "Click again to delete this row", run: () => { closeMenu(); void store.apply(action()); } });
+    } else {
+      button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
+    }
     menu.append(button);
   }
 
@@ -1420,7 +1512,11 @@ function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, clo
   ]) {
     const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
     if (danger && store.table.columns.length <= 1) button.disabled = true;
-    button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
+    if (label === "Delete column" && !button.disabled && columnHasData(store.table, colId)) {
+      armOnFirstClick(button, { armedTitle: "Click again to delete this column and its data", run: () => { closeMenu(); void store.apply(action()); } });
+    } else {
+      button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
+    }
     menu.append(button);
   }
 
@@ -1490,7 +1586,14 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
   nameRow.append(menuButton);
 
   const removeButton = element("button", { type: "button", className: "ntbl-th-remove", title: "Remove column", textContent: "×" });
-  removeButton.addEventListener("click", () => void store.apply(removeColumn(store.table, column.id)));
+  if (columnHasData(store.table, column.id)) {
+    armOnFirstClick(removeButton, {
+      armedTitle: "Click again to delete this column and its data",
+      run: () => void store.apply(removeColumn(store.table, column.id)),
+    });
+  } else {
+    removeButton.addEventListener("click", () => void store.apply(removeColumn(store.table, column.id)));
+  }
   nameRow.append(removeButton);
   th.append(nameRow);
 
@@ -1881,6 +1984,17 @@ function mountGrid(context, container, objectId) {
   function onDocumentKeyDown(event) {
     if (event.key === "Escape") { hideColumnMenu(); hideRangeMenu(); return; }
 
+    // Ctrl/Cmd+Z anywhere inside this table's own surface undoes the last
+    // edit through the table's own history, not whatever the browser thinks
+    // is undoable — previously this fell through to native undo and ate
+    // characters out of the note title instead of restoring a deleted
+    // column/row (there was no undo stack here at all).
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z" && event.target instanceof Element && shell.contains(event.target)) {
+      event.preventDefault();
+      void store.undo();
+      return;
+    }
+
     const focused = document.activeElement;
     const isGridControl = focused instanceof Element && shell.contains(focused) && ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName);
 
@@ -2116,7 +2230,14 @@ function mountGrid(context, container, objectId) {
         }
         const removeCell = element("td", { className: "ntbl-td ntbl-td-remove" });
         const removeButton = element("button", { type: "button", className: "ntbl-row-remove", title: "Remove row", textContent: "×" });
-        removeButton.addEventListener("click", () => void store.apply(removeRow(store.table, row.id)));
+        if (rowHasData(row)) {
+          armOnFirstClick(removeButton, {
+            armedTitle: "Click again to delete this row",
+            run: () => void store.apply(removeRow(store.table, row.id)),
+          });
+        } else {
+          removeButton.addEventListener("click", () => void store.apply(removeRow(store.table, row.id)));
+        }
         removeCell.append(removeButton);
         tr.append(removeCell);
         tbody.append(tr);
@@ -2135,7 +2256,16 @@ function mountGrid(context, container, objectId) {
         footRow.append(element("td", { className: "ntbl-td" }));
         for (const column of table.columns) {
           const cell = element("td", { className: "ntbl-td ntbl-foot-cell" });
-          if (column.type === "number") cell.textContent = column.format ? formatNumber(sums[column.id] ?? 0, column.format) : String(sums[column.id] ?? 0);
+          if (column.type === "number") {
+            const sum = sums[column.id] ?? 0;
+            // Round off float-accumulation noise (e.g. summing many decimals
+            // can land on 733.56000000001) before display — a footer total
+            // that looks precise-but-wrong is worse than one rounded to a
+            // sane number of decimals. 6 places is far past what any column
+            // format shows, so this never trims a real formatted value.
+            const clean = Math.round(sum * 1e6) / 1e6;
+            cell.textContent = column.format ? formatNumber(clean, column.format, store.context?.i18n?.locale) : String(clean);
+          }
           footRow.append(cell);
         }
         footRow.append(element("td", { className: "ntbl-td" }));
@@ -2348,6 +2478,7 @@ const styles = `
 .ntbl-cell-formula:not(:focus) { color: var(--notible-muted); }
 .ntbl-link-cell { display: flex; align-items: center; gap: 2px; }
 .ntbl-cell-link { flex: 1; min-width: 0; }
+.ntbl-cell-link--unresolved { outline: 1px dashed var(--notible-danger); outline-offset: -1px; }
 .ntbl-link-open { flex: none; border: 0; background: none; color: var(--notible-accent); cursor: pointer; font-size: 12px; padding: 2px 4px; }
 .ntbl-link-open:disabled { color: var(--notible-faint); cursor: default; }
 /* The right-click column panel: fixed so it floats above the scrollable
@@ -2417,6 +2548,7 @@ const styles = `
 .ntbl-td-remove { text-align: center; }
 .ntbl-row-remove { border: 0; background: none; padding: 4px 8px; color: var(--notible-faint); cursor: pointer; }
 .ntbl-row-remove:hover { color: var(--notible-danger); }
+.ntbl-danger-armed { color: var(--notible-danger) !important; font-weight: 600; }
 /* The leading per-row handle cell, sticky on the left the same way the
    header is sticky on top — a long row stays identifiable by its drag grip
    even when scrolled sideways past its own first data column. */
@@ -2443,7 +2575,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.4",
+    version: "0.6.6",
     apiVersion: "1.8",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
