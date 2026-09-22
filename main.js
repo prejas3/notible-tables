@@ -1222,10 +1222,17 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
       if (!query) { commit(""); return; }
       input.classList.remove("ntbl-cell-link--unresolved");
       try {
-        const objects = await store.context.data.objects.query({ limit: 5000 });
-        const exact = objects.find((object) => (object.title || "").toLowerCase() === query.toLowerCase());
-        const prefix = objects.filter((object) => (object.title || "").toLowerCase().startsWith(query.toLowerCase()));
-        const hit = exact ?? (prefix.length === 1 ? prefix[0] : null);
+        // Indexed lookup (API 1.18) instead of pulling up to 5000 objects and
+        // filtering client-side — that used to silently stop finding a real
+        // match past 5000 objects in the workspace, indistinguishable from a
+        // typo. Exact (case-insensitive) title match wins outright; failing
+        // that, a search that narrows to exactly one candidate still counts.
+        const exactHits = await store.context.data.objects.findByTitle(query, { exact: true });
+        let hit = exactHits[0] ?? null;
+        if (!hit) {
+          const candidates = await store.context.data.objects.findByTitle(query);
+          hit = candidates.length === 1 ? candidates[0] : null;
+        }
         if (hit) { commit(hit.id); return; }
         store.context.ui.notice(`No single object titled "${query}" — left as typed, not saved. Fix the title or clear the cell.`);
         input.classList.add("ntbl-cell-link--unresolved");
@@ -2575,8 +2582,8 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.6",
-    apiVersion: "1.8",
+    version: "0.6.7",
+    apiVersion: "1.18",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
     permissions: ["data.read", "data.write", "workspace.ui"],
