@@ -61,12 +61,9 @@ assert.deepEqual(plugin.manifest.permissions, declared.permissions);
 assert.equal(typeof plugin.onload, "function");
 assert.equal(typeof plugin.onunload, "function");
 
-// registerObjectTab is API 1.5, but this plugin also calls context.ui, which
-// is fine at 1.1 — the real floor here is registerObjectTab itself plus the
-// "table" entry in OBJECT_TAB_TYPES, both of which predate 1.8. Declaring
-// 1.8 anyway keeps it in step with every other builtin-shaped plugin shipped
-// alongside it, and is never a floor violation.
-assert.equal(declared.apiVersion, "1.8");
+// registerObjectTab is API 1.5, but the Link column now calls
+// context.data.objects.findByTitle, added in 1.18 — that's the real floor.
+assert.equal(declared.apiVersion, "1.18");
 assert.deepEqual([...declared.permissions].sort(), ["data.read", "data.write", "workspace.ui"]);
 assert.ok(!declared.permissions.includes("network"), "tables never leave the machine on their own");
 assert.equal(TABLE_TYPE, "table");
