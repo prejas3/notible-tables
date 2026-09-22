@@ -56,6 +56,23 @@ export function formatNumber(value, format) {
   return body;
 }
 
+/** Parse text that may be using the runtime's own locale grouping/decimal
+ * separators (what `formatNumber` above just produced) back into a plain
+ * number. NaN means "could not parse" — callers must not coerce that to 0,
+ * or a stray keystroke silently zeroes a cell. */
+export function parseFormattedNumber(raw) {
+  if (typeof raw !== "string") return NaN;
+  const trimmed = raw.trim();
+  if (trimmed === "") return NaN;
+  const parts = new Intl.NumberFormat().formatToParts(1234.5);
+  const group = parts.find((p) => p.type === "group")?.value ?? ",";
+  const decimal = parts.find((p) => p.type === "decimal")?.value ?? ".";
+  let normalized = trimmed.split(group).join("");
+  if (decimal !== ".") normalized = normalized.split(decimal).join(".");
+  normalized = normalized.replace(/[^0-9.\-]/g, "");
+  return normalized === "" || normalized === "-" ? NaN : Number(normalized);
+}
+
 // ------------------------------------------------------------ formula engine
 //
 // A cell whose text starts with "=" is a formula. Supported: + - * / ( ),
@@ -1154,8 +1171,10 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
     input.addEventListener("focus", () => { input.value = typeof value === "number" ? String(value) : ""; });
     input.addEventListener("blur", () => { input.value = typeof value === "number" ? formatNumber(value, column.format) : input.value; });
     input.addEventListener("change", () => {
-      const raw = input.value.replace(/[^0-9.\-]/g, "");
-      commit(raw === "" ? "" : Number(raw) || 0);
+      if (input.value.trim() === "") { commit(""); return; }
+      const parsed = parseFormattedNumber(input.value);
+      if (!Number.isFinite(parsed)) { input.value = typeof value === "number" ? formatNumber(value, column.format) : ""; return; }
+      commit(parsed);
     });
     return input;
   }
@@ -2424,7 +2443,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.3",
+    version: "0.6.4",
     apiVersion: "1.8",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
