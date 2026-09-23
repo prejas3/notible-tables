@@ -25,7 +25,9 @@ const NAME_LIMIT = 200;
 const CELL_LIMIT = 4000;
 const MAX_COLUMNS = 40;
 const MAX_ROWS = 2000;
-const MIN_COLUMN_WIDTH = 80;
+const MIN_COLUMN_WIDTH = 32;
+const DEFAULT_COLUMN_WIDTH = 140; // keep in step with .ntbl-th in the styles below
+const SPACER_WIDTH = 28; // .ntbl-th-spacer / .ntbl-td-handle
 const MAX_COLUMN_WIDTH = 640;
 
 /** The four cell kinds this version understands. Anything else in stored
@@ -976,20 +978,74 @@ export function columnSums(rows, columns) {
   return sums;
 }
 
-/** The drag-to-fill handle's mechanics: copy `source`'s cell values across
- * `target`, cycling through source rows/columns to cover a larger target.
- * No series detection (1, 2, 3…) — every filled cell is a literal copy of
- * whichever source cell lines up with it, same as dragging a single Excel
- * cell's fill handle without holding any modifier. */
-export function fillRange(table, source, target) {
+const DAY_MS = 86_400_000;
+
+/** Excel's fill-series guess for one column of source values, read top to
+ * bottom: two or more evenly spaced numbers (1, 2, 3 → 4, 5, 6), dates
+ * (YYYY-MM-DD) or text ending in a number with a shared prefix ("Item 1",
+ * "Item 2" → "Item 3"). Returns `(n) => value` for the n-th cell AFTER the
+ * source (0-based), or null when the values are not a series — the caller
+ * then copies, same as Excel does for a single cell or an uneven run.
+ * Formulas are never treated as a series. */
+export function seriesOf(values) {
+  if (values.length < 2 || values.some((value) => isFormula(value))) return null;
+  const evenStep = (numbers) => {
+    const step = numbers[1] - numbers[0];
+    return numbers.every((n, i) => i === 0 || Math.abs(n - numbers[i - 1] - step) < 1e-9) ? step : null;
+  };
+  // ponytail: 10 decimals kills float noise (0.1 + 0.2) without touching any real value a cell holds.
+  const tidy = (n) => Math.round(n * 1e10) / 1e10;
+
+  const numbers = values.map((v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN));
+  if (numbers.every(Number.isFinite)) {
+    const step = evenStep(numbers);
+    if (step === null) return null;
+    const last = numbers[numbers.length - 1];
+    const asString = typeof values[values.length - 1] === "string";
+    return (n) => (asString ? String(tidy(last + step * (n + 1))) : tidy(last + step * (n + 1)));
+  }
+
+  if (values.every((v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v))) {
+    const days = values.map((v) => Date.parse(`${v}T00:00:00Z`) / DAY_MS);
+    const step = days.every(Number.isFinite) ? evenStep(days) : null;
+    if (step === null) return null;
+    const last = days[days.length - 1];
+    return (n) => new Date((last + step * (n + 1)) * DAY_MS).toISOString().slice(0, 10);
+  }
+
+  const parts = values.map((v) => (typeof v === "string" ? /^(.*?)(\d+)$/.exec(v) : null));
+  if (parts.every(Boolean) && parts.every((m) => m[1] === parts[0][1])) {
+    const step = evenStep(parts.map((m) => Number(m[2])));
+    if (step === null) return null;
+    const last = Number(parts[parts.length - 1][2]);
+    return (n) => `${parts[0][1]}${last + step * (n + 1)}`;
+  }
+  return null;
+}
+
+/** The fill mechanics: copy `source`'s cell values across `target`, cycling
+ * through source rows/columns to cover a larger target. With `series` (the
+ * fill handle — Ctrl+D stays a plain copy, as in Excel) a source column that
+ * reads as a series continues it instead, see `seriesOf`. `target` is
+ * assumed to start right below the source. */
+export function fillRange(table, source, target, { series = false } = {}) {
   if (source.rowIds.length === 0 || source.columnIds.length === 0) return table;
+  const sourceRows = source.rowIds.map((id) => table.rows.find((row) => row.id === id));
+  const continued = new Map();
+  if (series && sourceRows.every(Boolean)) {
+    for (const columnId of source.columnIds) {
+      const next = seriesOf(sourceRows.map((row) => row.cells[columnId]));
+      if (next) continued.set(columnId, next);
+    }
+  }
   let next = table;
   for (let r = 0; r < target.rowIds.length; r++) {
-    const sourceRow = table.rows.find((row) => row.id === source.rowIds[r % source.rowIds.length]);
+    const sourceRow = sourceRows[r % sourceRows.length];
     if (!sourceRow) continue;
     for (let c = 0; c < target.columnIds.length; c++) {
       const sourceColumnId = source.columnIds[c % source.columnIds.length];
-      next = setCell(next, target.rowIds[r], target.columnIds[c], sourceRow.cells[sourceColumnId]);
+      const seriesNext = continued.get(sourceColumnId);
+      next = setCell(next, target.rowIds[r], target.columnIds[c], seriesNext ? seriesNext(r) : sourceRow.cells[sourceColumnId]);
     }
   }
   return next;
@@ -1128,7 +1184,28 @@ class TableStore {
     await this.persist(previous);
   }
 
+  /** Pick up a version of this table written elsewhere — in practice a sync
+   * pull while the grid is open. Without it the grid kept showing (and on
+   * the next edit, saving back over) the version it loaded, so a column
+   * added on another machine never appeared here. The undo history is
+   * dropped: stepping back would now mean undoing the other machine's edit. */
+  async refreshIfChanged() {
+    if (this.saving || this.loading) return;
+    const object = await this.context.data.objects.get(this.objectId).catch(() => null);
+    if (!object || this.saving || object.updated_at === this.updatedAt) return;
+    this.table = parseTable(object);
+    this.updatedAt = object.updated_at;
+    this.history = [];
+    this.remoteReload = true;
+    try { this.announce(); } finally { this.remoteReload = false; }
+  }
+
   async persist(next) {
+    this.saving = (this.saving ?? 0) + 1;
+    try { await this.save(next); } finally { this.saving -= 1; }
+  }
+
+  async save(next) {
     this.table = next;
     this.announce();
     const patch = { props: serializeTable(next) };
@@ -1615,11 +1692,15 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
     event.stopPropagation();
     const startX = event.clientX;
     const startWidth = th.getBoundingClientRect().width;
+    const tableEl = th.closest("table");
+    const startTableWidth = tableEl?.getBoundingClientRect().width ?? 0;
     resizeHandle.setPointerCapture(event.pointerId);
     function onMove(moveEvent) {
       const width = Math.round(Math.min(MAX_COLUMN_WIDTH, Math.max(MIN_COLUMN_WIDTH, startWidth + (moveEvent.clientX - startX))));
       th.style.width = `${width}px`;
       th.style.minWidth = `${width}px`;
+      // The table's own width is pinned (see render), so it grows with the column.
+      if (tableEl) tableEl.style.width = `${startTableWidth + width - startWidth}px`;
     }
     function onUp(upEvent) {
       resizeHandle.releasePointerCapture(upEvent.pointerId);
@@ -1671,6 +1752,30 @@ function mountGrid(context, container, objectId) {
   // it repeats the selected cell(s) into every visible row between the
   // selection and wherever the pointer is released.
   let fillDrag = null;
+  // Excel's two modes for the focused cell: false = selected ("ready":
+  // arrows move between cells, Ctrl+C copies the whole cell), true = being
+  // edited (arrows move the caret). Every cell is an <input>, so the mode is
+  // tracked here rather than by which element has focus: a fresh focus is
+  // "ready", typing / double-click / F2 switch to editing.
+  let editing = false;
+  let restoringFocus = false;
+  // The focused cell's value when it got focus -- what Escape puts back.
+  let editOriginal = "";
+  // The class drives the look: in ready mode the caret and the text
+  // highlight are hidden, so a selected cell reads as a selected CELL (its
+  // ring), not as selected text inside it.
+  function setEditing(next) {
+    editing = next;
+    shell.classList.toggle("is-editing", next);
+  }
+  /** A cell control whose text typing can replace (not a checkbox, select or date). */
+  const isTextCell = (el) => (el instanceof HTMLInputElement && ["text", "number"].includes(el.type)) || el instanceof HTMLTextAreaElement;
+  /** Empty a cell and save it, as Excel's Delete does. */
+  function clearCell(control) {
+    if (control instanceof HTMLInputElement && control.type === "checkbox") control.checked = false;
+    else control.value = "";
+    control.dispatchEvent(new Event("change", { bubbles: true }));
+  }
 
   // `link` cells store an object id; this map turns it into the object's
   // current title for display / copy / sort. Filled once on mount and after
@@ -1708,6 +1813,29 @@ function mountGrid(context, container, objectId) {
   const shell = element("div", { className: "ntbl-shell" });
   root.append(shell);
   shell.addEventListener("mousedown", onGridMouseDown);
+  shell.addEventListener("focusin", (event) => {
+    if (restoringFocus) return;
+    setEditing(false);
+    editOriginal = "value" in event.target ? event.target.value : "";
+  });
+  shell.addEventListener("input", () => setEditing(true));
+  shell.addEventListener("dblclick", (event) => {
+    const control = event.target instanceof Element ? event.target.closest("td[data-row-id] input, td[data-row-id] textarea") : null;
+    if (!control) return;
+    setEditing(true);
+    // A double-click selects the word under the pointer; Excel puts the
+    // caret there instead.
+    try { control.setSelectionRange(control.selectionEnd, control.selectionEnd); } catch { /* no caret on this input type */ }
+  });
+  // Dragging out part of a cell's text is editing: keep that selection
+  // visible (ready mode hides it) and let Ctrl+C copy just that part.
+  shell.addEventListener("mouseup", () => {
+    const control = document.activeElement;
+    if (!isTextCell(control) || !control.closest("td[data-row-id]")) return;
+    try {
+      if (control.selectionStart !== control.selectionEnd && !(control.selectionStart === 0 && control.selectionEnd === control.value.length)) setEditing(true);
+    } catch { /* number inputs have no caret info */ }
+  });
   shell.addEventListener("contextmenu", (event) => {
     const td = event.target instanceof Element ? event.target.closest("td[data-row-id]") : null;
     if (!td) return;
@@ -1804,6 +1932,20 @@ function mountGrid(context, container, objectId) {
       event.preventDefault();
       event.stopPropagation();
       fillDrag = { source: range, overRowId: null };
+    });
+    // Excel's double-click: fill down as far as the rows next to it have
+    // data — every contiguous visible row below that holds something in a
+    // column outside the source.
+    handle.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      const rows = visibleRows(store.table, filters, sort, resolveTitle);
+      let end = rows.findIndex((row) => row.id === range.rowIds[range.rowIds.length - 1]);
+      if (end === -1) return;
+      const hasNeighbourData = (row) => Object.entries(row.cells).some(([columnId, value]) =>
+        !range.columnIds.includes(columnId) && value !== "" && value !== null && value !== undefined && value !== false);
+      while (end + 1 < rows.length && hasNeighbourData(rows[end + 1])) end += 1;
+      const targetRows = computeFillTargetRows(range, rows[end].id);
+      if (targetRows) void store.apply(fillRange(store.table, range, targetRows, { series: true }));
     });
     root.append(handle);
   }
@@ -1966,7 +2108,7 @@ function mountGrid(context, container, objectId) {
     fillDrag = null;
     for (const el of shell.querySelectorAll(".is-fill-preview")) el.classList.remove("is-fill-preview");
     const targetRows = overRowId ? computeFillTargetRows(source, overRowId) : null;
-    if (targetRows) void store.apply(fillRange(store.table, source, targetRows));
+    if (targetRows) void store.apply(fillRange(store.table, source, targetRows, { series: true }));
   }
   document.addEventListener("mousemove", onFillDragMove);
   document.addEventListener("mouseup", onFillDragEnd);
@@ -1989,14 +2131,30 @@ function mountGrid(context, container, objectId) {
   // pasting a whole column from Excel), which this multi-cell-only guard
   // would otherwise block.
   function onDocumentKeyDown(event) {
-    if (event.key === "Escape") { hideColumnMenu(); hideRangeMenu(); return; }
+    if (event.key === "Escape") {
+      const control = document.activeElement;
+      // Escape while typing: throw the typing away, back to ready (Excel).
+      if (editing && isTextCell(control) && shell.contains(control) && control.closest("td[data-row-id]")) {
+        event.preventDefault();
+        control.value = editOriginal;
+        setEditing(false);
+        control.select();
+      }
+      hideColumnMenu();
+      hideRangeMenu();
+      return;
+    }
 
     // Ctrl/Cmd+Z anywhere inside this table's own surface undoes the last
     // edit through the table's own history, not whatever the browser thinks
     // is undoable — previously this fell through to native undo and ate
     // characters out of the note title instead of restoring a deleted
     // column/row (there was no undo stack here at all).
-    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z" && event.target instanceof Element && shell.contains(event.target)) {
+    // While typing in a cell, Ctrl+Z is that text's own undo (as in Excel) --
+    // it used to roll back the previous, unrelated table edit instead and then
+    // redraw the grid over what was being typed.
+    const typingInCell = editing && event.target instanceof Element && event.target.closest("td[data-row-id]");
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z" && !typingInCell && event.target instanceof Element && shell.contains(event.target)) {
       event.preventDefault();
       void store.undo();
       return;
@@ -2005,12 +2163,21 @@ function mountGrid(context, container, objectId) {
     const focused = document.activeElement;
     const isGridControl = focused instanceof Element && shell.contains(focused) && ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName);
 
+    // F2: start editing the cell in place, caret at the end — Excel's key.
+    if (isGridControl && event.key === "F2") {
+      event.preventDefault();
+      setEditing(true);
+      try { focused.setSelectionRange(focused.value.length, focused.value.length); } catch { /* no caret on this input type */ }
+      return;
+    }
+
     // Move the active cell. Tab/Enter always (Excel's "confirm and move
-    // on"); arrow keys only when the caret cannot travel further inside the
-    // current input in that direction — so typing and caret movement inside
-    // a cell keep working, and stepping off the edge moves to the next cell.
+    // on"). Arrow keys always while the cell is only selected (not typed
+    // into yet — see `editing`), and while editing only when the caret
+    // cannot travel further inside the input in that direction.
     function caretAtEdge(dir) {
       if (focused instanceof HTMLSelectElement) return false; // arrows change the option
+      if (!editing && focused.closest("td[data-row-id]")) return true;
       if (focused instanceof HTMLInputElement && focused.type === "checkbox") return true;
       if (!(focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement)) return true;
       let start, end;
@@ -2042,10 +2209,19 @@ function mountGrid(context, container, objectId) {
       event.preventDefault();
       const nextRowId = visibleIds[rowIndex];
       const nextColId = columnIds[colIndex];
+      // Commit the cell being left BEFORE looking up the next one: its
+      // `change` rebuilds the whole grid, so a control found first would be a
+      // detached node by the time it got focus — which is how the second
+      // Enter/arrow after an edit used to drop focus and scroll the page.
+      focused.blur();
       startSelection(nextRowId, nextColId, false);
       const nextTd = shell.querySelector(`td[data-row-id="${CSS.escape(nextRowId)}"][data-col-id="${CSS.escape(nextColId)}"]`);
       const control = nextTd?.querySelector("input, textarea, select");
-      if (control instanceof HTMLElement) control.focus();
+      if (control instanceof HTMLElement) {
+        control.focus();
+        // Arriving by keyboard selects the whole value, so typing replaces it.
+        try { control.select(); } catch { /* not every control can */ }
+      }
       return;
     }
 
@@ -2102,16 +2278,49 @@ function mountGrid(context, container, objectId) {
     }
 
     const range = getSelectionRange();
-    if (!range || (range.rowIds.length === 1 && range.columnIds.length === 1)) return;
+    if (!range) return;
+    // One cell, not being edited: Ctrl+C copies the cell itself, the way
+    // Excel copies a selected cell — unless the user dragged out a piece of
+    // its text, which then copies natively.
+    if (range.rowIds.length === 1 && range.columnIds.length === 1) {
+      let textSelected = false;
+      try { textSelected = isGridControl && focused.selectionStart !== focused.selectionEnd && !(focused.selectionStart === 0 && focused.selectionEnd === focused.value.length); } catch { /* no caret info */ }
+      const inCell = isGridControl && focused.closest("td[data-row-id]");
+      if (!inCell || editing) return;
+      if (meta && (key === "c" || key === "x") && !textSelected) {
+        event.preventDefault();
+        void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).then(() => {
+          if (key === "x") clearCell(focused);
+        }, () => {
+          context.ui.notice("Could not copy: the clipboard is unavailable.");
+        });
+      } else if (event.key === "Delete") {
+        event.preventDefault();
+        clearCell(focused);
+      } else if (event.key === "Backspace" && isTextCell(focused)) {
+        // Excel: clear and start typing.
+        event.preventDefault();
+        focused.value = "";
+        setEditing(true);
+      } else if (!meta && !event.altKey && event.key.length === 1 && isTextCell(focused)) {
+        // Typing into a selected (not edited) cell replaces it, as in Excel;
+        // the key itself then lands in the emptied input.
+        focused.value = "";
+        setEditing(true);
+      }
+      return;
+    }
     // Past the 1x1 early-return the range is explicitly multi-cell, so
     // Ctrl+C / Delete act on the range unconditionally. No activeElement
     // guard: focus always sits in a cell <input> after selecting (every
     // cell is one), and shift-click leaves a text selection there — the old
     // guard read that as "mid-edit" and fell through to a single-cell copy.
     // Single-cell / mid-typing is the 1x1 case, already returned above.
-    if (meta && key === "c") {
+    if (meta && (key === "c" || key === "x")) {
       event.preventDefault();
-      void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).catch(() => {
+      void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).then(() => {
+        if (key === "x") void store.apply(clearRangeCells(store.table, range));
+      }, () => {
         context.ui.notice("Could not copy: the clipboard is unavailable.");
       });
       return;
@@ -2143,7 +2352,17 @@ function mountGrid(context, container, objectId) {
     if (!clipboardText) return;
     const isMultiCell = range.rowIds.length > 1 || range.columnIds.length > 1;
     const looksLikeGrid = /\r\n|\n|\t/.test(clipboardText.replace(/\r?\n$/, ""));
-    if (!isMultiCell && !looksLikeGrid) return;
+    if (!isMultiCell && !looksLikeGrid) {
+      // A single value into a selected (not edited) cell replaces it, as in
+      // Excel; while editing it lands at the caret, natively.
+      const control = document.activeElement;
+      if (!editing && isTextCell(control) && shell.contains(control) && control.closest("td[data-row-id]")) {
+        event.preventDefault();
+        control.value = clipboardText.replace(/\r?\n$/, "");
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return;
+    }
     event.preventDefault();
     void store.apply(applyTsvPaste(store.table, range, clipboardText, sort, filters));
   }
@@ -2157,6 +2376,12 @@ function mountGrid(context, container, objectId) {
     const focused = document.activeElement;
     const focusKey = focused instanceof HTMLElement && shell.contains(focused) ? focused.dataset.focusKey : undefined;
     const caretRange = focusKey && "selectionStart" in focused ? [focused.selectionStart, focused.selectionEnd] : null;
+    // A table rewritten by sync while a cell is being typed into: keep what
+    // was typed on screen (it is committed on blur, as always) instead of
+    // silently swapping it for the pulled value. Only for that reload — on an
+    // ordinary render the stored value is the truth (undo, a commit's own
+    // normalisation).
+    const typed = focusKey && store.remoteReload && editing && focused.type !== "checkbox" && "value" in focused ? focused.value : null;
 
     shell.replaceChildren();
     if (store.loading) { shell.append(text("p", "Loading…", "ntbl-empty")); return; }
@@ -2180,6 +2405,12 @@ function mountGrid(context, container, objectId) {
       for (const column of table.columns) headRow.append(columnHeader(store, column, sort, setSort, filters, setFilter, showColumnMenu, startColumnDrag, selectColumn));
       headRow.append(element("th", { className: "ntbl-th ntbl-th-spacer" }));
       thead.append(headRow);
+      // Pin the table to the sum of its column widths. Under width:max-content
+      // Chromium sized every column from its <input>'s natural width (~170px),
+      // so a column could never be narrower than that whatever its th said —
+      // a "No." column was as wide as a text one. With an explicit width the
+      // fixed layout takes each th's width as given.
+      tableEl.style.width = `${SPACER_WIDTH * 2 + table.columns.reduce((sum, column) => sum + (column.width ?? DEFAULT_COLUMN_WIDTH), 0)}px`;
       tableEl.append(thead);
 
       const tbody = element("tbody");
@@ -2323,7 +2554,12 @@ function mountGrid(context, container, objectId) {
     if (focusKey) {
       const next = shell.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`);
       if (next instanceof HTMLElement) {
+        // The same cell getting its focus back is not a new visit: keep
+        // whichever mode (ready / editing) it was in.
+        restoringFocus = true;
         next.focus();
+        restoringFocus = false;
+        if (typed !== null) next.value = typed;
         if (caretRange && "setSelectionRange" in next) {
           try { next.setSelectionRange(caretRange[0], caretRange[1]); } catch { /* not every input type supports it (e.g. type=number) */ }
         }
@@ -2394,11 +2630,14 @@ function mountGrid(context, container, objectId) {
   }
 
   const stop = store.onChange(() => { render(); void refreshLinkTitles(); });
+  // Sync applies arrive as `workspace.changed` (no per-object event).
+  const workspaceWatch = context.events.on("workspace.changed", () => void store.refreshIfChanged());
   void store.load();
   container.append(root);
   return {
     dispose: () => {
       stop();
+      workspaceWatch?.dispose();
       document.removeEventListener("mousedown", onDocumentPointerDown);
       document.removeEventListener("keydown", onDocumentKeyDown);
       document.removeEventListener("mouseup", onDocumentMouseUp);
@@ -2460,7 +2699,19 @@ const styles = `
 /* Sticky header (top) and leading handle column (left) — position:sticky
    still lets an absolutely-positioned child (the resize handle) anchor to
    this cell, so it does not conflict with the old position:relative. */
-.ntbl-th { position: sticky; top: 0; z-index: 2; vertical-align: top; padding: 6px 8px 8px; border: 1px solid var(--notible-border); width: 140px; overflow: hidden; background: var(--notible-surface); }
+.ntbl-th { position: sticky; top: 0; z-index: 2; box-sizing: border-box; vertical-align: top; padding: 6px 6px 8px; border: 1px solid var(--notible-border); width: 140px; overflow: hidden; background: var(--notible-surface); }
+/* A narrow column (a "No." / "L.p." column) keeps its name readable: the
+   header's buttons step aside as it shrinks. Right-click on the header still
+   opens the column menu.
+   The name row is the container: size containment does not apply to a
+   table cell, so the th itself cannot be one. */
+.ntbl-th-name { container-type: inline-size; }
+@container (max-width: 110px) { .ntbl-th-drag, .ntbl-th-remove, .ntbl-th-badge { display: none; } }
+@container (max-width: 60px) { .ntbl-th-menu { display: none; } }
+/* No spin arrows: in a narrow number column they took half the cell, and a
+   click meant for the cell stepped its value instead. */
+.ntbl-cell-input[type="number"] { appearance: textfield; }
+.ntbl-cell-input[type="number"]::-webkit-inner-spin-button, .ntbl-cell-input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 .ntbl-th.is-drag-over { border-left: 2px solid var(--notible-accent); }
 .ntbl-th.is-dragging { opacity: .5; }
 .ntbl-th.is-col-selected { background: var(--notible-hover); }
@@ -2528,6 +2779,10 @@ const styles = `
   border-radius: 0;
   background: none;
 }
+/* Ready mode (a cell selected, not being typed in): no caret, no text
+   highlight -- the accent ring says which cell is selected. */
+.ntbl-shell:not(.is-editing) .ntbl-td .ntbl-cell-input, .ntbl-shell:not(.is-editing) .ntbl-td .ntbl-cell-textarea { caret-color: transparent; }
+.ntbl-shell:not(.is-editing) .ntbl-td .ntbl-cell-input::selection, .ntbl-shell:not(.is-editing) .ntbl-td .ntbl-cell-textarea::selection { background: transparent; }
 .ntbl-cell-input { width: 100%; box-sizing: border-box; border: 0; background: none; padding: 6px 8px; color: var(--notible-text); font: inherit; }
 .ntbl-cell-input:focus-visible { outline: 2px solid var(--notible-accent); outline-offset: -2px; }
 .ntbl-cell-textarea { width: 100%; box-sizing: border-box; resize: vertical; border: 0; background: none; padding: 6px 8px; color: var(--notible-text); font: inherit; }
@@ -2582,7 +2837,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.7",
+    version: "0.6.8",
     apiVersion: "1.18",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",

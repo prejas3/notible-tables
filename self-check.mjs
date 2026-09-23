@@ -22,6 +22,7 @@ import plugin, {
   defaultCellValue,
   duplicateRow,
   fillRange,
+  seriesOf,
   formatNumber,
   parseNumberFormat,
   isFormula,
@@ -499,7 +500,7 @@ assert.equal(widthTable.columns[0].width, 260);
 const widthRoundTrip = parseTable({ props: serializeTable(widthTable) });
 assert.equal(widthRoundTrip.columns[0].width, 260, "width survives serialize/parse");
 const tooNarrow = updateColumn(widthTable, widthTable.columns[0].id, { width: 10 });
-assert.equal(tooNarrow.columns[0].width, 80, "width is clamped to the minimum");
+assert.equal(tooNarrow.columns[0].width, 32, "width is clamped to the minimum");
 const tooWide = updateColumn(widthTable, widthTable.columns[0].id, { width: 5000 });
 assert.equal(tooWide.columns[0].width, 640, "width is clamped to the maximum");
 
@@ -608,5 +609,27 @@ const fillTarget = { rowIds: [filled.rows[1].id, filled.rows[2].id], columnIds: 
 filled = fillRange(filled, fillSource, fillTarget);
 assert.equal(filled.rows[1].cells[filled.columns[0].id], "X");
 assert.equal(filled.rows[2].cells[filled.columns[0].id], "X", "dragging the fill handle down repeats the single source cell");
+
+// --- series fill (fill handle only): 1,2,3 -> 4,5,6 like Excel
+const next = (values, count) => { const f = seriesOf(values); return f ? Array.from({ length: count }, (_, n) => f(n)) : null; };
+assert.deepEqual(next([1, 2, 3], 3), [4, 5, 6]);
+assert.deepEqual(next(["1", "2"], 2), ["3", "4"], "numeric text stays text");
+assert.deepEqual(next([10, 8], 2), [6, 4]);
+assert.deepEqual(next([0.1, 0.2], 1), [0.3], "no float noise");
+assert.deepEqual(next(["Item 1", "Item 2"], 1), ["Item 3"]);
+assert.deepEqual(next(["2026-09-29", "2026-09-30"], 2), ["2026-10-01", "2026-10-02"]);
+assert.equal(seriesOf([5]), null, "a single value is copied, not counted");
+assert.equal(seriesOf([1, 2, 4]), null, "uneven steps are copied");
+assert.equal(seriesOf(["=A1", "=A2"]), null, "formulas are never a series");
+assert.equal(seriesOf(["a", "b"]), null);
+let seq = parseTable({ props: "{}" });
+seq = addColumn(seq, { name: "No.", type: "number" });
+for (let i = 0; i < 5; i++) seq = addRow(seq);
+seq = setCell(seq, seq.rows[0].id, seq.columns[0].id, 1);
+seq = setCell(seq, seq.rows[1].id, seq.columns[0].id, 2);
+const seqSource = { rowIds: [seq.rows[0].id, seq.rows[1].id], columnIds: [seq.columns[0].id] };
+const seqTarget = { rowIds: seq.rows.slice(2).map((row) => row.id), columnIds: [seq.columns[0].id] };
+assert.deepEqual(fillRange(seq, seqSource, seqTarget, { series: true }).rows.map((row) => row.cells[seq.columns[0].id]), [1, 2, 3, 4, 5]);
+assert.deepEqual(fillRange(seq, seqSource, seqTarget).rows.map((row) => row.cells[seq.columns[0].id]), [1, 2, 1, 2, 1], "Ctrl+D stays a plain copy");
 
 console.log(`Notible Tables self-check passed: ${COLUMN_TYPES.length} column types, number formats, link resolution, formula engine, round trip, sort, filter, blank table, styles, merges, selection, TSV/clipboard, CSV export, insert/duplicate/reorder rows and columns, sums, and fill all verified.`);
