@@ -1823,6 +1823,16 @@ function mountGrid(context, container, objectId) {
   const shell = element("div", { className: "ntbl-shell" });
   root.append(shell);
   shell.addEventListener("mousedown", onGridMouseDown);
+  // The control a click is landing on. Leaving a header input commits it on
+  // blur, before the click's focus arrives, and that commit rebuilds the grid
+  // with focus on <body>: the clicked cell was destroyed, the next Tab walked
+  // into the sidebar and typing ended up in another note (round 2, 01.10).
+  // render() hands focus to this control when nothing in the grid has it.
+  let pressedFocusKey;
+  shell.addEventListener("pointerdown", (event) => {
+    pressedFocusKey = event.target instanceof Element ? event.target.closest("[data-focus-key]")?.dataset.focusKey : undefined;
+    setTimeout(() => { pressedFocusKey = undefined; }, 0);
+  }, true);
   shell.addEventListener("focusin", (event) => {
     if (restoringFocus) return;
     setEditing(false);
@@ -2215,13 +2225,26 @@ function mountGrid(context, container, objectId) {
       else if (event.key === "ArrowRight" && caretAtEdge("right")) move = [0, 1];
     }
     if (move) {
-      const range = getSelectionRange();
+      // The cell with the caret decides where Tab/Enter go. The selection
+      // state alone was not enough: after renaming a header it was empty, the
+      // handler bailed out before preventDefault, and Tab/Enter walked out of
+      // the grid into the sidebar, so the next rows were typed into another
+      // note (round 2 test, 01.10).
+      const focusTd = focused.closest("td[data-row-id]");
+      const range = focusTd
+        ? { rowIds: [focusTd.dataset.rowId], columnIds: [focusTd.dataset.colId] }
+        : getSelectionRange();
       if (!range) return;
       const visibleIds = visibleRows(store.table, filters, sort, resolveTitle).map((row) => row.id);
       const columnIds = store.table.columns.map((column) => column.id);
       let rowIndex = visibleIds.indexOf(range.rowIds[range.rowIds.length - 1]);
       let colIndex = columnIds.indexOf(range.columnIds[range.columnIds.length - 1]);
       if (rowIndex === -1 || colIndex === -1) return;
+      // Tab and Enter belong to the grid: they never move focus out of it.
+      if (focusTd && (event.key === "Tab" || event.key === "Enter")) event.preventDefault();
+      // Tab past the last column wraps to the next row, like a spreadsheet.
+      if (event.key === "Tab" && !event.shiftKey && colIndex === columnIds.length - 1 && rowIndex < visibleIds.length - 1) { move = [1, -colIndex]; tabStartCol = null; }
+      else if (event.key === "Tab" && event.shiftKey && colIndex === 0 && rowIndex > 0) { move = [-1, columnIds.length - 1]; tabStartCol = null; }
       // Only while still on the row the Tabs ran along: a click elsewhere ends the run.
       const currentRowId = visibleIds[rowIndex];
       if (tabStartCol?.rowId !== currentRowId) tabStartCol = null;
@@ -2407,7 +2430,7 @@ function mountGrid(context, container, objectId) {
     // control had focus (and where its caret was) before the rebuild
     // destroys it, then hand both back once the new one exists.
     const focused = document.activeElement;
-    const focusKey = focused instanceof HTMLElement && shell.contains(focused) ? focused.dataset.focusKey : undefined;
+    const focusKey = focused instanceof HTMLElement && shell.contains(focused) ? focused.dataset.focusKey : pressedFocusKey;
     const caretRange = focusKey && "selectionStart" in focused ? [focused.selectionStart, focused.selectionEnd] : null;
     // A table rewritten by sync while a cell is being typed into: keep what
     // was typed on screen (it is committed on blur, as always) instead of
@@ -2733,6 +2756,10 @@ const styles = `
    still lets an absolutely-positioned child (the resize handle) anchor to
    this cell, so it does not conflict with the old position:relative. */
 .ntbl-th { position: sticky; top: 0; z-index: 2; box-sizing: border-box; vertical-align: top; padding: 6px 6px 8px; border: 1px solid var(--notible-border); width: 140px; overflow: hidden; background: var(--notible-surface); }
+/* The header rested half a pixel below the scroll box's edge, and rows showed
+   through that strip while scrolling (Asahi table, 01.10). Tuck it 1px under
+   the edge and cover a few pixels above with its own background. */
+.ntbl-th { top: -1px; box-shadow: 0 -4px 0 var(--notible-surface); }
 /* A narrow column (a "No." / "L.p." column) keeps its name readable: the
    header's buttons step aside as it shrinks. Right-click on the header still
    opens the column menu.
@@ -2873,7 +2900,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.9",
+    version: "0.6.10",
     apiVersion: "1.18",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
