@@ -14,6 +14,7 @@ import plugin, {
   addRow,
   applyTsvPaste,
   blankTable,
+  TableStore,
   cellsToTsv,
   clearCellStyle,
   clearRangeCells,
@@ -631,5 +632,38 @@ const seqSource = { rowIds: [seq.rows[0].id, seq.rows[1].id], columnIds: [seq.co
 const seqTarget = { rowIds: seq.rows.slice(2).map((row) => row.id), columnIds: [seq.columns[0].id] };
 assert.deepEqual(fillRange(seq, seqSource, seqTarget, { series: true }).rows.map((row) => row.cells[seq.columns[0].id]), [1, 2, 3, 4, 5]);
 assert.deepEqual(fillRange(seq, seqSource, seqTarget).rows.map((row) => row.cells[seq.columns[0].id]), [1, 2, 1, 2, 1], "Ctrl+D stays a plain copy");
+
+// --- P1 (01.10): fast typing must not trip the optimistic lock. Each Enter
+// commits a cell; a second commit used to start while the first write was in
+// flight, carrying a stale updated_at -> "conflict" toast -> load() wiped the
+// grid together with whatever was being typed. The fake Core below rejects a
+// stale timestamp exactly like data.objects.update does.
+{
+  let stored = { id: "t1", type: TABLE_TYPE, title: "T", props: serializeTable(blankTable(parseTable({ props: "{}" }))), updated_at: "0" };
+  let clock = 0;
+  const notices = [];
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+  const context = {
+    ui: { notice: (message) => notices.push(message) },
+    data: { objects: {
+      get: async () => { await tick(); return { ...stored }; },
+      update: async (_id, patch, expected) => {
+        await tick();
+        if (expected !== stored.updated_at) throw new Error("conflict");
+        stored = { ...stored, ...patch, updated_at: String(++clock) };
+        return { ...stored };
+      },
+    } },
+  };
+  const store = new TableStore(context, "t1");
+  await store.load();
+  const column = store.table.columns[0].id;
+  const values = ["Desk", "Chair", "320"];
+  // Three Enters in a row, each before the previous write has returned.
+  await Promise.all(values.map((value, index) => store.apply(setCell(store.table, store.table.rows[index].id, column, value))));
+  assert.deepEqual(notices, [], "fast commits must not surface a conflict");
+  assert.deepEqual(parseTable(stored).rows.slice(0, 3).map((row) => row.cells[column]), values, "every committed cell must reach storage");
+  assert.deepEqual(store.table.rows.slice(0, 3).map((row) => row.cells[column]), values, "the grid must still show every cell");
+}
 
 console.log(`Notible Tables self-check passed: ${COLUMN_TYPES.length} column types, number formats, link resolution, formula engine, round trip, sort, filter, blank table, styles, merges, selection, TSV/clipboard, CSV export, insert/duplicate/reorder rows and columns, sums, and fill all verified.`);

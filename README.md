@@ -15,6 +15,9 @@ A lightweight spreadsheet-style table, kept as an ordinary workspace object.
   Unchecked".
 - Link a table into any note with `[[Table name]]` — clicking the link opens
   the full grid, the same way clicking it in the sidebar does.
+- Fill rows from the keyboard: `Tab` moves right, `Enter` goes to the next
+  row in the column where you started tabbing, and `Enter` on the last row
+  adds a new one.
 - Select a range by clicking and dragging, or Shift-click to extend it.
   `Ctrl`/`Cmd`+`C` copies it as tab-separated text; `Ctrl`/`Cmd`+`V` pastes a
   tab-separated block starting at the selection (clamped to the table's
@@ -64,8 +67,3 @@ other workspace object — nothing plugin-specific to migrate.
 ```
 node plugins/notible-tables/self-check.mjs
 ```
-
-## Install
-
-In Notible: **Settings -> Plugins -> Market**, then install "Notible Tables".
-This repo is the source; the market pulls `plugin.json` + `notible.tables.zip` from the latest GitHub Release.

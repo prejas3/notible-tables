@@ -1110,7 +1110,7 @@ function text(tag, value, className) {
 // clones — cheap to keep bounded history for.
 const UNDO_LIMIT = 50;
 
-class TableStore {
+export class TableStore {
   constructor(context, objectId) {
     this.context = context;
     this.objectId = objectId;
@@ -1200,15 +1200,22 @@ class TableStore {
     try { this.announce(); } finally { this.remoteReload = false; }
   }
 
+  /** Writes go out one at a time. Overlapping writes (Enter, type, Enter
+   * before the first returned) all carried the same stale `updatedAt`, so the
+   * second one hit the optimistic lock, and its fallback `load()` wiped the
+   * grid along with whatever was being typed (P1, 01.10). Each queued write
+   * sends the latest table, so a burst still ends with everything stored. */
   async persist(next) {
-    this.saving = (this.saving ?? 0) + 1;
-    try { await this.save(next); } finally { this.saving -= 1; }
-  }
-
-  async save(next) {
     this.table = next;
     this.announce();
-    const patch = { props: serializeTable(next) };
+    this.saving = (this.saving ?? 0) + 1;
+    const run = (this.writeQueue ?? Promise.resolve()).then(() => this.save());
+    this.writeQueue = run;
+    try { await run; } finally { this.saving -= 1; }
+  }
+
+  async save() {
+    const patch = { props: serializeTable(this.table) };
     try {
       const updated = await this.context.data.objects.update(this.objectId, patch, this.updatedAt);
       this.updatedAt = updated.updated_at;
@@ -1758,6 +1765,9 @@ function mountGrid(context, container, objectId) {
   // tracked here rather than by which element has focus: a fresh focus is
   // "ready", typing / double-click / F2 switch to editing.
   let editing = false;
+  // Column where a run of Tabs began: Enter returns there on the next row,
+  // like a spreadsheet, so Tab-Tab-Enter fills row after row (P1).
+  let tabStartCol = null;
   let restoringFocus = false;
   // The focused cell's value when it got focus -- what Escape puts back.
   let editOriginal = "";
@@ -1908,12 +1918,21 @@ function mountGrid(context, container, objectId) {
         const overlay = element("div", { className: "ntbl-format-bar-overlay" });
         const bar = formattingToolbar(store, range);
         bar.style.left = `${Math.max(8, rect.left)}px`;
-        bar.style.top = `${Math.max(8, rect.top - 44)}px`;
+        bar.style.top = `${formatBarTop(rect, range)}px`;
         overlay.append(bar);
         root.append(overlay);
       }
     }
     updateFillHandle(range);
+  }
+  // The format bar sits above the selection unless that would cover the
+  // column headers (P1/CP84); then it goes under the selection's last row.
+  function formatBarTop(anchorRect, range) {
+    const headerBottom = shell.querySelector("thead")?.getBoundingClientRect().bottom ?? 0;
+    const above = anchorRect.top - 44;
+    if (above >= Math.max(8, headerBottom)) return above;
+    const lastTd = shell.querySelector(`td[data-row-id="${CSS.escape(range.rowIds[range.rowIds.length - 1])}"]`);
+    return (lastTd?.getBoundingClientRect().bottom ?? anchorRect.bottom) + 6;
   }
   // The small square at the bottom-right corner of the selection, dragged
   // to fill — lives on `root` like the other overlays above, rebuilt on
@@ -2203,10 +2222,24 @@ function mountGrid(context, container, objectId) {
       let rowIndex = visibleIds.indexOf(range.rowIds[range.rowIds.length - 1]);
       let colIndex = columnIds.indexOf(range.columnIds[range.columnIds.length - 1]);
       if (rowIndex === -1 || colIndex === -1) return;
+      // Only while still on the row the Tabs ran along: a click elsewhere ends the run.
+      const currentRowId = visibleIds[rowIndex];
+      if (tabStartCol?.rowId !== currentRowId) tabStartCol = null;
+      if (event.key === "Tab") tabStartCol ??= { rowId: currentRowId, colId: columnIds[colIndex] };
+      else if (event.key === "Enter" && tabStartCol && columnIds.includes(tabStartCol.colId)) colIndex = columnIds.indexOf(tabStartCol.colId);
+      if (event.key !== "Tab") tabStartCol = null;
       rowIndex += move[0];
       colIndex += move[1];
-      if (rowIndex < 0 || rowIndex >= visibleIds.length || colIndex < 0 || colIndex >= columnIds.length) return;
+      // Enter on the last row grows the table, so filling a list never stalls
+      // (P1). Only unsorted and unfiltered, where the new last row is the one shown last.
+      const growRow = event.key === "Enter" && !event.shiftKey && rowIndex === visibleIds.length && !sort && Object.values(filters).every((value) => value === "");
+      if (rowIndex < 0 || (rowIndex >= visibleIds.length && !growRow) || colIndex < 0 || colIndex >= columnIds.length) return;
       event.preventDefault();
+      if (growRow) {
+        focused.blur();
+        void store.apply(addRow(store.table));
+        visibleIds.push(store.table.rows[store.table.rows.length - 1].id);
+      }
       const nextRowId = visibleIds[rowIndex];
       const nextColId = columnIds[colIndex];
       // Commit the cell being left BEFORE looking up the next one: its
@@ -2597,7 +2630,7 @@ function mountGrid(context, container, objectId) {
         const overlay = element("div", { className: "ntbl-format-bar-overlay" });
         const bar = formattingToolbar(store, formatRange);
         bar.style.left = `${Math.max(8, rect.left)}px`;
-        bar.style.top = `${Math.max(8, rect.top - 44)}px`;
+        bar.style.top = `${formatBarTop(rect, formatRange)}px`;
         overlay.append(bar);
         root.append(overlay);
       }
@@ -2810,6 +2843,9 @@ const styles = `
 .ntbl-td-remove { text-align: center; }
 .ntbl-row-remove { border: 0; background: none; padding: 4px 8px; color: var(--notible-faint); cursor: pointer; }
 .ntbl-row-remove:hover { color: var(--notible-danger); }
+/* Delete buttons stay out of sight until the row/header is pointed at or reached by keyboard (CE68). */
+.ntbl-row-remove, .ntbl-th-remove { opacity: 0; }
+tr:hover .ntbl-row-remove, tr:focus-within .ntbl-row-remove, th:hover .ntbl-th-remove, th:focus-within .ntbl-th-remove { opacity: 1; }
 .ntbl-danger-armed { color: var(--notible-danger) !important; font-weight: 600; }
 /* The leading per-row handle cell, sticky on the left the same way the
    header is sticky on top — a long row stays identifiable by its drag grip
@@ -2837,7 +2873,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.8",
+    version: "0.6.9",
     apiVersion: "1.18",
     description: "A lightweight spreadsheet-style table, kept as an ordinary workspace object. New tables start as a 3x3 grid. Select a range (drag, shift-click) to copy/paste/clear or bulk bold/color it, navigate with arrow keys, Ctrl+D/Ctrl+R to fill down/right, merge cells for headers or section labels, export to CSV, and wrap long text in a column. Right-click a column header for sort, format and filter. Create one from the \"+\" menu and link it into any note with [[Table name]]; opening the link opens the full grid.",
     author: "Notible",
