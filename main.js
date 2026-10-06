@@ -503,6 +503,41 @@ export function serializeTable(table) {
   });
 }
 
+/**
+ * E14B-FORMAT (Hive #2): a table embedded in a note is a ```notible-table
+ * fence. Line 1 is the header (everything `serializeTable` writes except
+ * `rows`, plus `"v":1`), then one JSON line per row. JSON escapes newlines, so
+ * no line can start with ``` and close the fence early; cell text stays plain
+ * so note search finds it.
+ */
+export const EMBED_LANGUAGE = "notible-table";
+const EMBED_VERSION = 1;
+
+export function serializeEmbedded(table) {
+  const { rows, ...header } = JSON.parse(serializeTable(table));
+  return [JSON.stringify({ v: EMBED_VERSION, ...header }), ...rows.map((row) => JSON.stringify(row))].join("\n");
+}
+
+/** Strict, unlike `parseTable`: a block someone hand-edited into something
+ * unreadable must not come back as a shorter table that the next edit saves
+ * over the original. Any bad line, an unknown version or a table over the
+ * limits returns `error`, and the grid stays read-only. */
+export function parseEmbedded(source) {
+  try {
+    const lines = String(source ?? "").split("\n").filter((line) => line.trim());
+    if (!lines.length) throw new Error("the table is empty");
+    const parsed = lines.map((line) => JSON.parse(line));
+    if (parsed.some((value) => !value || typeof value !== "object" || Array.isArray(value))) throw new Error("a line is not a table entry");
+    const { v, ...header } = parsed[0];
+    if (v !== EMBED_VERSION) throw new Error("this table was written by a newer version of Notible Tables");
+    const rows = parsed.slice(1);
+    if (rows.length > MAX_ROWS || (Array.isArray(header.columns) && header.columns.length > MAX_COLUMNS)) throw new Error("the table is over the size limit");
+    return { table: parseTable({ props: JSON.stringify({ ...header, rows }) }), error: null };
+  } catch (cause) {
+    return { table: parseTable({ props: "{}" }), error: String(cause?.message ?? cause) };
+  }
+}
+
 /** Append a column with a fresh id, and give every existing row the new
  * column's default value — a cell no row has yet is still there to fill in,
  * not a gap that only appears once someone types into it. */
@@ -1237,6 +1272,51 @@ export class TableStore {
   }
 }
 
+/**
+ * E14B-STORE (Hive #2): the store behind a table embedded in a note. The note
+ * owns saving and conflicts, so every committed edit hands the new source back
+ * to Core synchronously (`updateSource`). Nothing is ever pending when the
+ * note switches. No write queue, no optimistic lock, no refetch: a change from
+ * outside (undo, sync) remounts the block with the new source instead.
+ */
+export class EmbeddedTableStore extends TableStore {
+  constructor(context, codeBlock) {
+    super(context, null);
+    this.codeBlock = codeBlock;
+    const parsed = parseEmbedded(codeBlock.source);
+    this.table = parsed.table;
+    this.error = parsed.error;
+    this.loading = false;
+    this.saving = 0;
+    this.readOnly = Boolean(parsed.error) || codeBlock.readOnly === true;
+  }
+
+  async load() { this.announce(); }
+
+  async refreshIfChanged() {}
+
+  async apply(next) {
+    if (this.readOnly) return;
+    await super.apply(next);
+  }
+
+  async persist(next) {
+    if (this.readOnly) return;
+    this.table = next;
+    this.announce();
+    this.save();
+  }
+
+  save() {
+    let written = false;
+    try { written = this.codeBlock.updateSource(serializeEmbedded(this.table)) === true; } catch { written = false; }
+    if (written) return;
+    this.readOnly = true;
+    this.context.ui?.notice?.("This table is no longer in the note, so the edit was not saved.");
+    this.announce();
+  }
+}
+
 const TYPE_LABEL = { text: "Text", number: "Number", date: "Date", checkbox: "Checkbox", select: "Select", link: "Link" };
 
 /** One cell's input control, keyed to `column.type`. Committed on blur/change
@@ -1731,8 +1811,9 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
  * that was opened, whether that was a click in the sidebar tree or a
  * `[[Table name]]` link inside a note.
  */
-function mountGrid(context, container, objectId) {
-  const store = new TableStore(context, objectId);
+// E14B-GRID (Hive #2): `store` is a TableStore (a standalone table object) or
+// an EmbeddedTableStore (a table inside a note, `embedded: true`).
+function mountGrid(context, container, store, { embedded = false } = {}) {
   let sort = null;
   const filters = {};
   // The one column-menu popup open at a time, right-clicked or opened via
@@ -2147,6 +2228,15 @@ function mountGrid(context, container, objectId) {
   // fixed, outside the scroll container it was opened from.
   function onDocumentPointerDown(event) {
     const target = event.target;
+    // E14B-LISTENERS (Hive #2): an embedded grid shares the document with the
+    // note. A press anywhere else drops the cell selection, so a multi-cell
+    // Delete/Ctrl+C/Ctrl+D cannot hit these cells while you type in the note.
+    if (embedded && !(target instanceof Node && root.contains(target))) {
+      hideColumnMenu();
+      hideRangeMenu();
+      if (selection) { selection = null; dragging = false; render(); }
+      return;
+    }
     if (openMenu && !(target instanceof Element && target.closest(".ntbl-colmenu, .ntbl-th-menu"))) hideColumnMenu();
     if (rangeMenu && !(target instanceof Element && target.closest(".ntbl-rangemenu"))) hideRangeMenu();
   }
@@ -2160,6 +2250,8 @@ function mountGrid(context, container, objectId) {
   // pasting a whole column from Excel), which this multi-cell-only guard
   // would otherwise block.
   function onDocumentKeyDown(event) {
+    // E14B-LISTENERS (Hive #2): keys typed in the note are not ours.
+    if (embedded && !(event.target instanceof Node && root.contains(event.target))) return;
     if (event.key === "Escape") {
       const control = document.activeElement;
       // Escape while typing: throw the typing away, back to ready (Excel).
@@ -2441,7 +2533,7 @@ function mountGrid(context, container, objectId) {
 
     shell.replaceChildren();
     if (store.loading) { shell.append(text("p", "Loading…", "ntbl-empty")); return; }
-    if (store.error) { shell.append(text("p", store.error, "ntbl-empty")); return; }
+    if (store.error) { shell.append(text("p", embedded ? `This table could not be read (${store.error}). Edit its source above to fix it.` : store.error, "ntbl-empty")); return; }
 
     const raw = store.table;
     // Everything below display/export/sums/sort works from the resolved
@@ -2721,6 +2813,11 @@ function mountGrid(context, container, objectId) {
 // outline instead of a fill, no card inside a card.
 const styles = `
 .ntbl { color: var(--notible-text); font-size: 13px; min-width: 0; }
+/* E14B-EMBED (Hive #2): a table inside a note scrolls in its own box, so a
+   long one does not push the rest of the note a screen away.
+   It sits inside Core's <pre>, so the text font and wrapping are reset
+   (the mono font also cut the column names short). */
+.nt-embed { max-width: 100%; max-height: 480px; overflow: auto; padding: 0 12px 12px; font-family: var(--notible-font-sans); white-space: normal; line-height: normal; }
 /* minmax(0,1fr) keeps the shell (lead text, summary, actions) at the
    container's width; the wide table below overflows it and Core's own
    .core-container-slot — the one scroll box, height-bounded to the viewport —
@@ -2900,11 +2997,11 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.6.11",
-    apiVersion: "1.18",
+    version: "0.7.0",
+    apiVersion: "1.24",
     description: "Simple spreadsheets inside Notible: a grid you can sort, filter, format and fill quickly, kept as an ordinary item you can link from any note.",
     author: "Notible",
-    permissions: ["data.read", "data.write", "workspace.ui"],
+    permissions: ["data.read", "data.write", "workspace.ui", "editor.extension"],
   },
 
   onload(context) {
@@ -2935,13 +3032,36 @@ export default {
       // menu (`addPluginObject`) already opens it, and doing so again here
       // would double-navigate. See work-models.ts/whiteboard.ts for the same
       // convention.
-      creates: { objectType: TABLE_TYPE, label: "Data table", icon: "table" },
+      // slashMenu: false: in a note, "/New data table" is the inline one below.
+      creates: { objectType: TABLE_TYPE, label: "Data table", icon: "table", slashMenu: false },
       execute: async () => context.data.objects.create({
         type: TABLE_TYPE,
         title: "New table",
         props: serializeTable(blankTable(parseTable({ props: "{}" }))),
       }),
     }));
+
+    // E14B-EMBED (Hive #2): "/New data table" in a note writes a
+    // ```notible-table fence; the grid below draws it and writes every edit
+    // straight back into the note. Persistent, so typing in a cell does not
+    // tear the grid down when the note re-renders around it.
+    this._disposables.push(context.commands.register({
+      id: "insert-inline",
+      name: "New data table",
+      description: "A table kept inside this note: typed columns, sorting, fill.",
+      insertsBlock: { language: EMBED_LANGUAGE },
+      execute: () => serializeEmbedded(blankTable(parseTable({ props: "{}" }))),
+    }));
+    this._disposables.push(context.editor.registerCodeBlockRenderer(EMBED_LANGUAGE, (block) => {
+      const store = new EmbeddedTableStore(context, block);
+      const shell = document.createElement("div");
+      shell.className = "nt-embed";
+      block.container.appendChild(shell);
+      const mount = mountGrid(context, shell, store, { embedded: true });
+      // nq-ready hides the raw fence text; a broken source stays visible to fix.
+      if (!store.error) block.container.classList.add("nq-ready");
+      return { dispose: () => { mount.dispose(); shell.remove(); } };
+    }, { persistent: true }));
 
     // The grid itself: mounted whenever a table object is opened, by row
     // click or by a [[wikilink]] to it. `"table"` is in Core's
@@ -2950,7 +3070,7 @@ export default {
       id: "grid",
       label: "Table",
       objectTypes: [TABLE_TYPE],
-      mount: (container, tabContext) => mountGrid(context, container, tabContext.objectId),
+      mount: (container, tabContext) => mountGrid(context, container, new TableStore(context, tabContext.objectId)),
     }));
   },
 

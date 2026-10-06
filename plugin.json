@@ -1,16 +1,17 @@
 {
   "id": "notible.tables",
   "name": "Notible Tables",
-  "version": "0.6.11",
-  "apiVersion": "1.18",
-  "minCoreVersion": "0.87.5",
+  "version": "0.7.0",
+  "apiVersion": "1.24",
+  "minCoreVersion": "0.95.0",
   "description": "Simple spreadsheets inside Notible: a grid you can sort, filter, format and fill quickly, kept as an ordinary item you can link from any note.",
   "author": "Notible",
   "entry": "main.js",
   "permissions": [
     "data.read",
     "data.write",
-    "workspace.ui"
+    "workspace.ui",
+    "editor.extension"
   ],
-  "guide": "Create one from the **+** menu → **Data table**, or link it into a note with `[[Table name]]`.\n\n## Working in it\n\n- `Tab` moves right, `Enter` goes to the next row; `Enter` on the last row adds one.\n- Drag across cells to copy, paste, clear or format them together. `Ctrl+D` / `Ctrl+R` fill down or right.\n- Right-click a column header to sort, format or filter it. Export to CSV from the table's menu."
+  "guide": "Create one from the **+** menu → **Data table**, or type `/New data table` in a note to keep one inside it, or link one into a note with `[[Table name]]`.\n\n## Working in it\n\n- `Tab` moves right, `Enter` goes to the next row; `Enter` on the last row adds one.\n- Drag across cells to copy, paste, clear or format them together. `Ctrl+D` / `Ctrl+R` fill down or right.\n- Right-click a column header to sort, format or filter it. Export to CSV from the table's menu."
 }

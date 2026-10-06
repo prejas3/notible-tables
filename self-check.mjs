@@ -51,6 +51,10 @@ import plugin, {
   unmergeCells,
   updateColumn,
   visibleRows,
+  EMBED_LANGUAGE,
+  serializeEmbedded,
+  parseEmbedded,
+  EmbeddedTableStore,
 } from "./main.js";
 
 // --- identity
@@ -64,9 +68,10 @@ assert.equal(typeof plugin.onload, "function");
 assert.equal(typeof plugin.onunload, "function");
 
 // registerObjectTab is API 1.5, but the Link column now calls
-// context.data.objects.findByTitle, added in 1.18 — that's the real floor.
-assert.equal(declared.apiVersion, "1.18");
-assert.deepEqual([...declared.permissions].sort(), ["data.read", "data.write", "workspace.ui"]);
+// context.data.objects.findByTitle, added in 1.18. The inline table (Hive #2)
+// needs 1.24: insertsBlock, persistent renderers, updateSource.
+assert.equal(declared.apiVersion, "1.24");
+assert.deepEqual([...declared.permissions].sort(), ["data.read", "data.write", "editor.extension", "workspace.ui"]);
 assert.ok(!declared.permissions.includes("network"), "tables never leave the machine on their own");
 assert.equal(TABLE_TYPE, "table");
 
@@ -664,6 +669,78 @@ assert.deepEqual(fillRange(seq, seqSource, seqTarget).rows.map((row) => row.cell
   assert.deepEqual(notices, [], "fast commits must not surface a conflict");
   assert.deepEqual(parseTable(stored).rows.slice(0, 3).map((row) => row.cells[column]), values, "every committed cell must reach storage");
   assert.deepEqual(store.table.rows.slice(0, 3).map((row) => row.cells[column]), values, "the grid must still show every cell");
+}
+
+// E14B-FORMAT (Hive #2): a table embedded in a note as a ```notible-table fence.
+{
+  assert.equal(EMBED_LANGUAGE, "notible-table");
+  let t = blankTable(parseTable({ props: "{}" }));
+  t = addColumn(t, { name: "Amount", type: "number" });
+  const amount = t.columns[3].id;
+  t = updateColumn(t, amount, { format: { decimals: 2 } });
+  t = setCell(t, t.rows[0].id, t.columns[0].id, "line one\n```three ticks");
+  t = setCell(t, t.rows[1].id, amount, 12.5);
+  t = setCellStyle(t, t.rows[0].id, t.columns[0].id, { bold: true });
+  t = mergeCells(t, { rowIds: [t.rows[1].id, t.rows[2].id], columnIds: [t.columns[1].id] });
+  const src = serializeEmbedded(t);
+  const lines = src.split("\n");
+  assert.ok(!lines.some((line) => line.startsWith("```")), "no line of the body can close the fence");
+  assert.equal(lines.length, 1 + t.rows.length, "a header line plus one line per row");
+  assert.equal(JSON.parse(lines[0]).v, 1);
+  const back = parseEmbedded(src);
+  assert.equal(back.error, null);
+  assert.equal(serializeEmbedded(back.table), src, "byte-stable round trip");
+  assert.equal(back.table.rows[0].cells[t.columns[0].id], "line one\n```three ticks", "multi-line cell text survives");
+  assert.equal(back.table.merges.length, 1, "merges survive");
+  assert.ok(parseEmbedded(src + "\n{broken").error, "a damaged line is an error, not a shorter table");
+  assert.ok(parseEmbedded(src.replace('"v":1', '"v":9')).error, "an unknown version is an error");
+  assert.ok(parseEmbedded("").error, "an empty body is an error");
+
+  const writes = [];
+  let alive = true;
+  const notices = [];
+  const context = { ui: { notice: (text) => notices.push(text) } };
+  const store = new EmbeddedTableStore(context, { source: src, readOnly: false, updateSource: (next) => { if (!alive) return false; writes.push(next); return true; } });
+  assert.equal(store.loading, false);
+  assert.equal(store.readOnly, false);
+  store.load();
+  store.apply(addRow(store.table));
+  assert.equal(writes.length, 1, "one synchronous write per committed edit, no debounce");
+  assert.equal(parseEmbedded(writes[0]).table.rows.length, t.rows.length + 1);
+  store.undo();
+  assert.equal(writes.length, 2, "grid undo writes back too");
+  assert.equal(writes[1], src);
+  alive = false;
+  store.apply(addRow(store.table));
+  assert.equal(store.readOnly, true, "a removed block stops the store");
+  assert.equal(notices.length, 1);
+  store.apply(addRow(store.table));
+  assert.equal(notices.length, 1, "and it stays quiet afterwards");
+
+  const broken = new EmbeddedTableStore(context, { source: src + "\n{broken", readOnly: false, updateSource: () => { throw new Error("a damaged block must never be saved over"); } });
+  broken.load();
+  broken.apply(addRow(broken.table));
+  assert.equal(broken.readOnly, true);
+  assert.ok(broken.error);
+  const viewOnly = new EmbeddedTableStore(context, { source: src, readOnly: true, updateSource: () => { throw new Error("read-only note must not be written"); } });
+  viewOnly.apply(addRow(viewOnly.table));
+
+  // E14B-EMBED: onload wires the slash command and a persistent renderer.
+  const commands = [];
+  const renderers = [];
+  const fake = {
+    data: { types: { upsert: async () => {} } },
+    commands: { register: (c) => { commands.push(c); return { dispose() {} }; } },
+    views: { registerObjectTab: () => ({ dispose() {} }) },
+    editor: { registerCodeBlockRenderer: (language, render, options) => { renderers.push({ language, options }); return { dispose() {} }; } },
+  };
+  plugin.onload(fake);
+  const inline = commands.find((c) => c.insertsBlock);
+  assert.equal(inline.insertsBlock.language, EMBED_LANGUAGE);
+  assert.equal(parseEmbedded(inline.execute()).error, null, "the inserted block is a valid table");
+  assert.equal(commands.find((c) => c.creates).creates.slashMenu, false, "only one New data table in the / menu");
+  assert.deepEqual(renderers, [{ language: EMBED_LANGUAGE, options: { persistent: true } }]);
+  plugin.onunload();
 }
 
 console.log(`Notible Tables self-check passed: ${COLUMN_TYPES.length} column types, number formats, link resolution, formula engine, round trip, sort, filter, blank table, styles, merges, selection, TSV/clipboard, CSV export, insert/duplicate/reorder rows and columns, sums, and fill all verified.`);

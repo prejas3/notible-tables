@@ -7,6 +7,10 @@ A lightweight spreadsheet-style table, kept as an ordinary workspace object.
   `/table` slash command inserts an inline Markdown table, a different thing,
   and the two would be indistinguishable in the "/" menu under the same name.
   A new table starts as a 3×3 grid, not an empty state.
+- Or type `/New data table` in a note: the table lives inside that note as a
+  ```` ```notible-table ```` block (one JSON line per row) and every edit is
+  written straight back into the note (0.7.0, API 1.24). The "+" menu's table
+  stays its own object.
 - Add typed columns: text, number, date, checkbox, select.
 - Right-click a column header (or its "⋯" button) for sort, format (column
   type, and options for a select column) and filter — a small badge on the
