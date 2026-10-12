@@ -19,6 +19,13 @@
  * them under plain node; the plugin itself is the default export.
  */
 
+// I18N (Hive #28): every UI string goes through t(); Polish is in
+// locales/pl.json (checked by scripts/plugin-locale-check.mjs). English until
+// onload() hands t over to Core's translator, which also follows a language
+// change. tr() only marks a module-level label that is passed to t() later.
+let t = (key, values) => (values ? key.replace(/\{(\w+)\}/g, (whole, name) => (name in values ? String(values[name]) : whole)) : key);
+const tr = (key) => key;
+
 export const TABLE_TYPE = "table";
 
 const NAME_LIMIT = 200;
@@ -543,7 +550,7 @@ export function parseEmbedded(source) {
  * not a gap that only appears once someone types into it. */
 export function addColumn(table, { name, type, options } = {}) {
   if (table.columns.length >= MAX_COLUMNS) return table;
-  const column = parseColumn({ name: name || `Column ${table.columns.length + 1}`, type, options });
+  const column = parseColumn({ name: name || t("Column {n}", { n: table.columns.length + 1 }), type, options });
   return {
     ...table,
     columns: [...table.columns, column],
@@ -1116,7 +1123,7 @@ function armOnFirstClick(button, { armedLabel, armedTitle, run }) {
       armed = true;
       button.classList.add("ntbl-danger-armed");
       if (armedLabel) button.textContent = armedLabel;
-      button.title = armedTitle ?? "Click again to confirm";
+      button.title = armedTitle ?? t("Click again to confirm");
       timer = setTimeout(disarm, 2500);
       event.stopPropagation();
       return;
@@ -1178,7 +1185,7 @@ export class TableStore {
     try {
       const object = await this.context.data.objects.get(this.objectId);
       if (!object) {
-        this.error = "This table no longer exists.";
+        this.error = t("This table no longer exists.");
       } else {
         this.table = parseTable(object);
         this.updatedAt = object.updated_at;
@@ -1312,12 +1319,12 @@ export class EmbeddedTableStore extends TableStore {
     try { written = this.codeBlock.updateSource(serializeEmbedded(this.table)) === true; } catch { written = false; }
     if (written) return;
     this.readOnly = true;
-    this.context.ui?.notice?.("This table is no longer in the note, so the edit was not saved.");
+    this.context.ui?.notice?.(t("This table is no longer in the note, so the edit was not saved."));
     this.announce();
   }
 }
 
-const TYPE_LABEL = { text: "Text", number: "Number", date: "Date", checkbox: "Checkbox", select: "Select", link: "Link" };
+const TYPE_LABEL = { text: tr("Text"), number: tr("Number"), date: tr("Date"), checkbox: tr("Checkbox"), select: tr("Select"), link: tr("Link") };
 
 /** One cell's input control, keyed to `column.type`. Committed on blur/change
  * rather than on every keystroke — a table's `apply` writes the whole grid,
@@ -1372,7 +1379,7 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
       type: "text",
       className: "ntbl-cell-input ntbl-cell-link",
       value: typeof value === "string" && value ? `[[${title ?? value}]]` : "",
-      placeholder: "[[Object title]]",
+      placeholder: t("[[Object title]]"),
     });
     input.dataset.focusKey = focusKey;
     // On no/ambiguous match, DO NOT commit — committing the old stored value
@@ -1407,7 +1414,7 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
     });
     wrap.append(input);
     if (typeof value === "string" && value) {
-      const open = element("button", { type: "button", className: "ntbl-link-open", title: title ? `Open "${title}"` : "This reference no longer resolves", textContent: "↗" });
+      const open = element("button", { type: "button", className: "ntbl-link-open", title: title ? `Open "${title}"` : t("This reference no longer resolves"), textContent: "↗" });
       if (!title) open.disabled = true;
       open.addEventListener("click", () => void store.context.ui.openObject(value));
       wrap.append(open);
@@ -1466,11 +1473,11 @@ function cellInput(store, row, column, resolveTitle, rawRow) {
 function filterControl(column, filters, setFilter) {
   if (column.type === "checkbox") {
     const select = element("select", { className: "ntbl-th-filter" });
-    for (const [value, label] of [["", "Any"], ["checked", "Checked"], ["unchecked", "Unchecked"]]) select.append(element("option", { value, textContent: label, selected: (filters[column.id] ?? "") === value }));
+    for (const [value, label] of [["", t("Any")], ["checked", t("Checked")], ["unchecked", t("Unchecked")]]) select.append(element("option", { value, textContent: label, selected: (filters[column.id] ?? "") === value }));
     select.addEventListener("change", () => setFilter(column.id, select.value));
     return select;
   }
-  const input = element("input", { className: "ntbl-th-filter", placeholder: "Filter…", value: filters[column.id] ?? "" });
+  const input = element("input", { className: "ntbl-th-filter", placeholder: t("Filter…"), value: filters[column.id] ?? "" });
   // A live filter's own render() rebuilds the whole grid on every keystroke
   // (the filtered row set can only be recomputed from a fresh table read),
   // which would otherwise replace this very input out from under the caret
@@ -1489,9 +1496,9 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
   const menu = element("div", { className: "ntbl-colmenu" });
 
   const sortRow = element("div", { className: "ntbl-colmenu-row" });
-  sortRow.append(text("span", "Sort", "ntbl-colmenu-label"));
+  sortRow.append(text("span", t("Sort"), "ntbl-colmenu-label"));
   const sortGroup = element("div", { className: "ntbl-colmenu-sort" });
-  for (const [direction, label, glyph] of [["asc", "Ascending", "▲"], ["desc", "Descending", "▼"]]) {
+  for (const [direction, label, glyph] of [["asc", t("Ascending"), "▲"], ["desc", t("Descending"), "▼"]]) {
     const isActive = sort?.columnId === column.id && sort.direction === direction;
     const button = element("button", {
       type: "button",
@@ -1506,9 +1513,9 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
   menu.append(sortRow);
 
   const formatRow = element("div", { className: "ntbl-colmenu-row" });
-  formatRow.append(text("span", "Format", "ntbl-colmenu-label"));
+  formatRow.append(text("span", t("Format"), "ntbl-colmenu-label"));
   const typeSelect = element("select", { className: "ntbl-th-type" });
-  for (const type of COLUMN_TYPES) typeSelect.append(element("option", { value: type, textContent: TYPE_LABEL[type], selected: type === column.type }));
+  for (const type of COLUMN_TYPES) typeSelect.append(element("option", { value: type, textContent: t(TYPE_LABEL[type]), selected: type === column.type }));
   typeSelect.addEventListener("change", () => void store.apply(updateColumn(store.table, column.id, { type: typeSelect.value })));
   formatRow.append(typeSelect);
   menu.append(formatRow);
@@ -1518,17 +1525,17 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
     const wrapLabel = element("label", { className: "ntbl-colmenu-checkbox" });
     const wrapCheckbox = element("input", { type: "checkbox", checked: column.wrap === true });
     wrapCheckbox.addEventListener("change", () => void store.apply(updateColumn(store.table, column.id, { wrap: wrapCheckbox.checked })));
-    wrapLabel.append(wrapCheckbox, text("span", "Wrap text"));
+    wrapLabel.append(wrapCheckbox, text("span", t("Wrap text")));
     wrapRow.append(wrapLabel);
     menu.append(wrapRow);
   }
 
   if (column.type === "select") {
     const optionsRow = element("div", { className: "ntbl-colmenu-row" });
-    optionsRow.append(text("span", "Options", "ntbl-colmenu-label"));
+    optionsRow.append(text("span", t("Options"), "ntbl-colmenu-label"));
     const options = element("input", {
       className: "ntbl-th-options",
-      placeholder: "Comma separated",
+      placeholder: t("Comma separated"),
       value: (column.options ?? []).join(", "),
     });
     options.addEventListener("change", () => {
@@ -1546,18 +1553,18 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
       void store.apply(updateColumn(store.table, column.id, { format: next }));
     };
     const numRow = element("div", { className: "ntbl-colmenu-row" });
-    numRow.append(text("span", "Number", "ntbl-colmenu-label"));
+    numRow.append(text("span", t("Number"), "ntbl-colmenu-label"));
     const styleSelect = element("select", { className: "ntbl-th-type" });
-    for (const [value, label] of [["plain", "Plain"], ["currency", "Currency"], ["percent", "Percent"]]) {
+    for (const [value, label] of [["plain", t("Plain")], ["currency", t("Currency")], ["percent", t("Percent")]]) {
       styleSelect.append(element("option", { value, textContent: label, selected: value === fmt.style }));
     }
     styleSelect.addEventListener("change", () => applyFormat({ style: styleSelect.value }));
     numRow.append(styleSelect);
-    const decimals = element("input", { type: "number", className: "ntbl-th-decimals", min: 0, max: 4, value: String(fmt.decimals ?? 0), title: "Decimal places" });
+    const decimals = element("input", { type: "number", className: "ntbl-th-decimals", min: 0, max: 4, value: String(fmt.decimals ?? 0), title: t("Decimal places") });
     decimals.addEventListener("change", () => applyFormat({ decimals: Math.min(4, Math.max(0, Math.round(Number(decimals.value) || 0))) }));
     numRow.append(decimals);
     if (fmt.style === "currency") {
-      const symbol = element("input", { className: "ntbl-th-symbol", placeholder: "zł", value: fmt.symbol ?? "", title: "Currency symbol" });
+      const symbol = element("input", { className: "ntbl-th-symbol", placeholder: "zł", value: fmt.symbol ?? "", title: t("Currency symbol") });
       symbol.addEventListener("change", () => applyFormat({ symbol: symbol.value.trim() }));
       numRow.append(symbol);
     }
@@ -1565,16 +1572,16 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
   }
 
   const filterRow = element("div", { className: "ntbl-colmenu-row" });
-  filterRow.append(text("span", "Filter", "ntbl-colmenu-label"));
+  filterRow.append(text("span", t("Filter"), "ntbl-colmenu-label"));
   filterRow.append(filterControl(column, filters, setFilter));
   menu.append(filterRow);
 
   const insertRow_ = element("div", { className: "ntbl-colmenu-row" });
-  insertRow_.append(text("span", "Insert", "ntbl-colmenu-label"));
+  insertRow_.append(text("span", t("Insert"), "ntbl-colmenu-label"));
   const insertGroup = element("div", { className: "ntbl-colmenu-sort" });
-  const insertLeftButton = element("button", { type: "button", className: "ntbl-colmenu-btn", title: "Insert column left", textContent: "◀+" });
+  const insertLeftButton = element("button", { type: "button", className: "ntbl-colmenu-btn", title: t("Insert column left"), textContent: "◀+" });
   insertLeftButton.addEventListener("click", () => void store.apply(insertColumnAt(store.table, column.id, "before")));
-  const insertRightButton = element("button", { type: "button", className: "ntbl-colmenu-btn", title: "Insert column right", textContent: "+▶" });
+  const insertRightButton = element("button", { type: "button", className: "ntbl-colmenu-btn", title: t("Insert column right"), textContent: "+▶" });
   insertRightButton.addEventListener("click", () => void store.apply(insertColumnAt(store.table, column.id, "after")));
   insertGroup.append(insertLeftButton, insertRightButton);
   insertRow_.append(insertGroup);
@@ -1592,7 +1599,7 @@ function columnMenu(store, column, sort, setSort, filters, setFilter) {
 function formattingToolbar(store, range) {
   const bar = element("div", { className: "ntbl-format-bar" });
 
-  const boldButton = element("button", { type: "button", className: "ntbl-format-btn", title: "Bold", textContent: "B" });
+  const boldButton = element("button", { type: "button", className: "ntbl-format-btn", title: t("Bold"), textContent: "B" });
   boldButton.style.fontWeight = "700";
   boldButton.addEventListener("click", () => void store.apply(setRangeStyle(store.table, range, { bold: true })));
   bar.append(boldButton);
@@ -1604,11 +1611,11 @@ function formattingToolbar(store, range) {
     bar.append(swatch);
   }
 
-  const noneSwatch = element("button", { type: "button", className: "ntbl-format-swatch ntbl-format-swatch--none", title: "No color" });
+  const noneSwatch = element("button", { type: "button", className: "ntbl-format-swatch ntbl-format-swatch--none", title: t("No color") });
   noneSwatch.addEventListener("click", () => void store.apply(setRangeStyle(store.table, range, { color: undefined })));
   bar.append(noneSwatch);
 
-  const clearButton = element("button", { type: "button", className: "ntbl-format-btn", title: "Clear formatting", textContent: "Clear" });
+  const clearButton = element("button", { type: "button", className: "ntbl-format-btn", title: t("Clear formatting"), textContent: t("Clear") });
   clearButton.addEventListener("click", () => void store.apply(clearRangeStyle(store.table, range)));
   bar.append(clearButton);
 
@@ -1631,27 +1638,27 @@ function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, clo
   const existingMerge = (store.table.merges ?? []).find((m) => m.startRowIndex === startRowIndex && m.startColIndex === startColIndex);
 
   if (existingMerge) {
-    const unmergeButton = element("button", { type: "button", className: "ntbl-rangemenu-btn", textContent: "Unmerge" });
+    const unmergeButton = element("button", { type: "button", className: "ntbl-rangemenu-btn", textContent: t("Unmerge") });
     unmergeButton.addEventListener("click", () => { closeMenu(); void store.apply(unmergeCells(store.table, existingMerge.startRowIndex, existingMerge.startColIndex)); });
     menu.append(unmergeButton);
   } else if (isMultiCell) {
     const viewConstrained = Boolean(sort) || Object.values(filters ?? {}).some((value) => value !== undefined && value !== null && value !== "");
-    const mergeButton = element("button", { type: "button", className: "ntbl-rangemenu-btn", textContent: "Merge cells" });
+    const mergeButton = element("button", { type: "button", className: "ntbl-rangemenu-btn", textContent: t("Merge cells") });
     mergeButton.disabled = viewConstrained;
-    mergeButton.title = viewConstrained ? "Clear the active sort or filter first — merge needs rows and columns in their stored order." : "";
+    mergeButton.title = viewConstrained ? t("Clear the active sort or filter first — merge needs rows and columns in their stored order.") : "";
     mergeButton.addEventListener("click", () => { closeMenu(); void store.apply(mergeCells(store.table, range, sort, filters)); });
     menu.append(mergeButton);
   }
 
   menu.append(element("div", { className: "ntbl-rangemenu-sep" }));
   for (const [label, run, danger] of [
-    ["Copy", () => navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).catch(() => store.context?.ui?.notice?.("Could not copy: the clipboard is unavailable.")), false],
-    ["Paste", async () => {
+    [t("Copy"), () => navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).catch(() => store.context?.ui?.notice?.(t("Could not copy: the clipboard is unavailable."))), false],
+    [t("Paste"), async () => {
       let tsv = "";
       try { tsv = await navigator.clipboard.readText(); } catch { return; }
       if (tsv) await store.apply(applyTsvPaste(store.table, range, tsv, sort, filters));
     }, false],
-    ["Clear contents", () => store.apply(clearRangeCells(store.table, range)), true],
+    [t("Clear contents"), () => store.apply(clearRangeCells(store.table, range)), true],
   ]) {
     const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
     button.addEventListener("click", () => { closeMenu(); void run(); });
@@ -1660,15 +1667,15 @@ function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, clo
 
   menu.append(element("div", { className: "ntbl-rangemenu-sep" }));
   for (const [label, action, danger] of [
-    ["Insert row above", () => insertRow(store.table, rowId, "above")],
-    ["Insert row below", () => insertRow(store.table, rowId, "below")],
-    ["Duplicate row", () => duplicateRow(store.table, rowId)],
-    ["Delete row", () => removeRow(store.table, rowId), true],
+    [t("Insert row above"), () => insertRow(store.table, rowId, "above")],
+    [t("Insert row below"), () => insertRow(store.table, rowId, "below")],
+    [t("Duplicate row"), () => duplicateRow(store.table, rowId)],
+    [t("Delete row"), () => removeRow(store.table, rowId), true],
   ]) {
     const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
     if (danger && store.table.rows.length <= 1) button.disabled = true;
-    if (label === "Delete row" && !button.disabled && rowHasData(store.table.rows.find((row) => row.id === rowId) ?? { cells: {} })) {
-      armOnFirstClick(button, { armedTitle: "Click again to delete this row", run: () => { closeMenu(); void store.apply(action()); } });
+    if (label === t("Delete row") && !button.disabled && rowHasData(store.table.rows.find((row) => row.id === rowId) ?? { cells: {} })) {
+      armOnFirstClick(button, { armedTitle: t("Click again to delete this row"), run: () => { closeMenu(); void store.apply(action()); } });
     } else {
       button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
     }
@@ -1677,14 +1684,14 @@ function rangeMenu_(store, range, sort, filters, resolveTitle, rowId, colId, clo
 
   menu.append(element("div", { className: "ntbl-rangemenu-sep" }));
   for (const [label, action, danger] of [
-    ["Insert column left", () => insertColumnAt(store.table, colId, "before")],
-    ["Insert column right", () => insertColumnAt(store.table, colId, "after")],
-    ["Delete column", () => removeColumn(store.table, colId), true],
+    [t("Insert column left"), () => insertColumnAt(store.table, colId, "before")],
+    [t("Insert column right"), () => insertColumnAt(store.table, colId, "after")],
+    [t("Delete column"), () => removeColumn(store.table, colId), true],
   ]) {
     const button = element("button", { type: "button", className: danger ? "ntbl-rangemenu-btn ntbl-rangemenu-btn--danger" : "ntbl-rangemenu-btn", textContent: label });
     if (danger && store.table.columns.length <= 1) button.disabled = true;
-    if (label === "Delete column" && !button.disabled && columnHasData(store.table, colId)) {
-      armOnFirstClick(button, { armedTitle: "Click again to delete this column and its data", run: () => { closeMenu(); void store.apply(action()); } });
+    if (label === t("Delete column") && !button.disabled && columnHasData(store.table, colId)) {
+      armOnFirstClick(button, { armedTitle: t("Click again to delete this column and its data"), run: () => { closeMenu(); void store.apply(action()); } });
     } else {
       button.addEventListener("click", () => { closeMenu(); void store.apply(action()); });
     }
@@ -1724,7 +1731,7 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
   // it ever fires, so a `draggable` element never starts a drag inside this
   // app. The rest of this grid already drags cell selections and resizes
   // columns the same pointer-tracking way, so this just follows suit.
-  const dragHandle = element("button", { type: "button", className: "ntbl-th-drag", title: "Drag to move this column", textContent: "⠿" });
+  const dragHandle = element("button", { type: "button", className: "ntbl-th-drag", title: t("Drag to move this column"), textContent: "⠿" });
   dragHandle.addEventListener("mousedown", (event) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -1747,7 +1754,7 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
   const menuButton = element("button", {
     type: "button",
     className: "ntbl-th-menu",
-    title: "Sort, format and filter this column",
+    title: t("Sort, format and filter this column"),
     textContent: "⋯",
   });
   menuButton.addEventListener("click", (event) => {
@@ -1756,10 +1763,10 @@ function columnHeader(store, column, sort, setSort, filters, setFilter, openMenu
   });
   nameRow.append(menuButton);
 
-  const removeButton = element("button", { type: "button", className: "ntbl-th-remove", title: "Remove column", textContent: "×" });
+  const removeButton = element("button", { type: "button", className: "ntbl-th-remove", title: t("Remove column"), textContent: "×" });
   if (columnHasData(store.table, column.id)) {
     armOnFirstClick(removeButton, {
-      armedTitle: "Click again to delete this column and its data",
+      armedTitle: t("Click again to delete this column and its data"),
       run: () => void store.apply(removeColumn(store.table, column.id)),
     });
   } else {
@@ -1893,7 +1900,7 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
     titlesInFlight = true;
     try {
       const objects = await context.data.objects.query({ limit: 5000 });
-      titleById = new Map(objects.map((object) => [object.id, object.title || "Untitled"]));
+      titleById = new Map(objects.map((object) => [object.id, object.title || t("Untitled")]));
     } catch { /* leave ids showing */ }
     finally { titlesInFlight = false; }
     render();
@@ -2440,7 +2447,7 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
         void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).then(() => {
           if (key === "x") clearCell(focused);
         }, () => {
-          context.ui.notice("Could not copy: the clipboard is unavailable.");
+          context.ui.notice(t("Could not copy: the clipboard is unavailable."));
         });
       } else if (event.key === "Delete") {
         event.preventDefault();
@@ -2469,7 +2476,7 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
       void navigator.clipboard.writeText(cellsToTsv(resolveFormulas(store.table), range, resolveTitle)).then(() => {
         if (key === "x") void store.apply(clearRangeCells(store.table, range));
       }, () => {
-        context.ui.notice("Could not copy: the clipboard is unavailable.");
+        context.ui.notice(t("Could not copy: the clipboard is unavailable."));
       });
       return;
     }
@@ -2532,7 +2539,7 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
     const typed = focusKey && store.remoteReload && editing && focused.type !== "checkbox" && "value" in focused ? focused.value : null;
 
     shell.replaceChildren();
-    if (store.loading) { shell.append(text("p", "Loading…", "ntbl-empty")); return; }
+    if (store.loading) { shell.append(text("p", t("Loading…"), "ntbl-empty")); return; }
     if (store.error) { shell.append(text("p", embedded ? `This table could not be read (${store.error}). Edit its source above to fix it.` : store.error, "ntbl-empty")); return; }
 
     const raw = store.table;
@@ -2543,7 +2550,7 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
     const rawById = new Map(raw.rows.map((row) => [row.id, row]));
 
     if (table.columns.length === 0) {
-      shell.append(text("p", "No columns yet.", "ntbl-empty"));
+      shell.append(text("p", t("No columns yet."), "ntbl-empty"));
     } else {
       const scroll = element("div", { className: "ntbl-scroll" });
       const tableEl = element("table", { className: "ntbl-table" });
@@ -2582,12 +2589,12 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
         // a block of rows. A real drag ends in a store.apply/render that
         // replaces this node, so a trailing click here is inert.
         handleCell.addEventListener("click", (event) => selectRow(row.id, event.shiftKey));
-        const rowDragHandle = element("button", { type: "button", className: "ntbl-row-drag", title: "Drag to move this row", textContent: "⠿" });
+        const rowDragHandle = element("button", { type: "button", className: "ntbl-row-drag", title: t("Drag to move this row"), textContent: "⠿" });
         rowDragHandle.addEventListener("mousedown", (event) => {
           if (event.button !== 0) return;
           event.preventDefault();
           event.stopPropagation();
-          if (sort) { context.ui.notice("Clear the active sort first to reorder rows."); return; }
+          if (sort) { context.ui.notice(t("Clear the active sort first to reorder rows.")); return; }
           startRowDrag(row.id);
         });
         handleCell.append(rowDragHandle);
@@ -2615,10 +2622,10 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
           tr.append(td);
         }
         const removeCell = element("td", { className: "ntbl-td ntbl-td-remove" });
-        const removeButton = element("button", { type: "button", className: "ntbl-row-remove", title: "Remove row", textContent: "×" });
+        const removeButton = element("button", { type: "button", className: "ntbl-row-remove", title: t("Remove row"), textContent: "×" });
         if (rowHasData(row)) {
           armOnFirstClick(removeButton, {
-            armedTitle: "Click again to delete this row",
+            armedTitle: t("Click again to delete this row"),
             run: () => void store.apply(removeRow(store.table, row.id)),
           });
         } else {
@@ -2668,15 +2675,15 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
     }
 
     const actions = element("div", { className: "ntbl-actions" });
-    const addRowButton = element("button", { type: "button", className: "ntbl-button", textContent: "+ Row" });
+    const addRowButton = element("button", { type: "button", className: "ntbl-button", textContent: t("+ Row") });
     addRowButton.disabled = table.columns.length === 0;
     addRowButton.addEventListener("click", () => void store.apply(addRow(store.table)));
-    const addColumnButton = element("button", { type: "button", className: "ntbl-button", textContent: "+ Column" });
+    const addColumnButton = element("button", { type: "button", className: "ntbl-button", textContent: t("+ Column") });
     addColumnButton.addEventListener("click", () => void store.apply(addColumn(store.table, {})));
     // Same Blob + <a download> pattern plugins/builtin/domain-plugin-ui.tsx
     // and CoreOnlyApp.tsx already use for Markdown export — no Tauri
     // save-dialog call needed, no new permission.
-    const exportButton = element("button", { type: "button", className: "ntbl-button", textContent: "Export CSV" });
+    const exportButton = element("button", { type: "button", className: "ntbl-button", textContent: t("Export CSV") });
     exportButton.disabled = table.columns.length === 0;
     exportButton.addEventListener("click", () => {
       const blob = new Blob([toCsv(table, resolveTitle)], { type: "text/csv" });
@@ -2691,8 +2698,8 @@ function mountGrid(context, container, store, { embedded = false } = {}) {
     const lockButton = element("button", {
       type: "button",
       className: table.lockWidths ? "ntbl-button ntbl-button--on" : "ntbl-button",
-      textContent: table.lockWidths ? "🔒 Widths locked" : "Lock widths",
-      title: table.lockWidths ? "Column widths are locked — click to allow resizing again." : "Freeze every column width and hide the resize handles.",
+      textContent: table.lockWidths ? t("🔒 Widths locked") : t("Lock widths"),
+      title: table.lockWidths ? t("Column widths are locked — click to allow resizing again.") : t("Freeze every column width and hide the resize handles."),
     });
     lockButton.disabled = table.columns.length === 0;
     lockButton.addEventListener("click", () => void store.apply({ ...store.table, lockWidths: !store.table.lockWidths }));
@@ -2997,7 +3004,7 @@ export default {
   manifest: {
     id: "notible.tables",
     name: "Notible Tables",
-    version: "0.7.0",
+    version: "0.7.1",
     apiVersion: "1.24",
     description: "Simple spreadsheets inside Notible: a grid you can sort, filter, format and fill quickly, kept as an ordinary item you can link from any note.",
     author: "Notible",
@@ -3005,6 +3012,8 @@ export default {
   },
 
   onload(context) {
+
+    if (context.i18n?.t) t = (key, values) => context.i18n.t(key, values);
     this._disposables = [];
 
     // A blank icon/name is better than "unknown type"; failing this must not
@@ -3025,18 +3034,18 @@ export default {
     // the same command.
     this._disposables.push(context.commands.register({
       id: "new-table",
-      name: "New data table",
-      description: "Create a table you can fill with typed columns and link into any note. Not the same as the \"/table\" Markdown table — this is its own object.",
+      name: t("New data table"),
+      description: t("Create a table you can fill with typed columns and link into any note. Not the same as the \"/table\" Markdown table — this is its own object."),
       // No self-navigation here, on purpose: a `creates` command's caller
       // decides what happens with the object it hands back — Core's own "+"
       // menu (`addPluginObject`) already opens it, and doing so again here
       // would double-navigate. See work-models.ts/whiteboard.ts for the same
       // convention.
       // slashMenu: false: in a note, "/New data table" is the inline one below.
-      creates: { objectType: TABLE_TYPE, label: "Data table", icon: "table", slashMenu: false },
+      creates: { objectType: TABLE_TYPE, label: t("Data table"), icon: "table", slashMenu: false },
       execute: async () => context.data.objects.create({
         type: TABLE_TYPE,
-        title: "New table",
+        title: t("New table"),
         props: serializeTable(blankTable(parseTable({ props: "{}" }))),
       }),
     }));
@@ -3047,8 +3056,8 @@ export default {
     // tear the grid down when the note re-renders around it.
     this._disposables.push(context.commands.register({
       id: "insert-inline",
-      name: "New data table",
-      description: "A table kept inside this note: typed columns, sorting, fill.",
+      name: t("New data table"),
+      description: t("A table kept inside this note: typed columns, sorting, fill."),
       insertsBlock: { language: EMBED_LANGUAGE },
       execute: () => serializeEmbedded(blankTable(parseTable({ props: "{}" }))),
     }));
@@ -3068,7 +3077,7 @@ export default {
     // `OBJECT_TAB_TYPES` allowlist for this purpose.
     this._disposables.push(context.views.registerObjectTab({
       id: "grid",
-      label: "Table",
+      label: t("Table"),
       objectTypes: [TABLE_TYPE],
       mount: (container, tabContext) => mountGrid(context, container, new TableStore(context, tabContext.objectId)),
     }));
